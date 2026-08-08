@@ -31,18 +31,23 @@ the Python in [`pyhunt/scripts/`](pyhunt/scripts/) is a set of helpers the skill
 shells out to.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"background":"#0d1117","primaryColor":"#161b22","primaryTextColor":"#ffffff","primaryBorderColor":"#3d444d","lineColor":"#9aa4b2","secondaryColor":"#1c2128","tertiaryColor":"#21262d","mainBkg":"#161b22","textColor":"#ffffff","nodeTextColor":"#ffffff","edgeLabelBackground":"#161b22","fontSize":"14px"}}}%%
 flowchart LR
-    OP["Operator"] -->|"/pyhunt &lt;target&gt;"| CC["Claude Code"]
-    CC --> SK["The skill<br/><i>SKILL.md + phases/</i>"]
-    SK --> AN["Static analysis<br/><i>call graph, taint, recon</i>"]
-    AN --> HU["Hunt agents<br/><i>one class, one location</i>"]
+    OP["Operator"] -->|"/pyhunt"| CC["Claude Code"]
+    CC --> SK["The skill<br/>SKILL.md + phases"]
+    SK --> AN["Static analysis<br/>call graph, taint, recon"]
+    AN --> HU["Hunt agents<br/>one class, one location"]
     HU --> PO["Proof-of-concept"]
-    PO --> CT["Fresh container ×3<br/><i>separate kernel</i>"]
-    CT --> GA["Deterministic gate<br/><i>five conditions</i>"]
+    PO --> CT["Fresh container ×3<br/>separate kernel"]
+    CT --> GA["Deterministic gate<br/>five conditions"]
     GA --> RE["report.json<br/>report.md"]
 
-    style GA fill:#eefaf0,stroke:#3fa15c
-    style CT fill:#fff3e6,stroke:#e08c2e
+    classDef base fill:#161b22,stroke:#3d444d,color:#ffffff
+    classDef run fill:#2a2113,stroke:#9e7b28,color:#ffffff
+    classDef good fill:#12261c,stroke:#2ea043,color:#ffffff
+    class OP,CC,SK,AN,HU,PO base
+    class CT run
+    class GA,RE good
 ```
 
 ### Design principles
@@ -78,40 +83,81 @@ flowchart LR
 
 ## How PyHunt compares
 
-PyHunt is not the first agentic security tool, and it borrows from the ones
-below — see [NOTICE](NOTICE) for the attribution chain. The distinction it
-draws is narrow and specific: **it is the only one of these that runs a
-candidate exploit and computes the verdict outside the model.**
+PyHunt is not the first agentic security tool and does not claim a novel idea.
+Anthropic's reference harness independently arrived at the same core discipline
+— execute the candidate, re-run it in a container the finder never touched,
+gate the whole thing on real isolation. PyHunt's contribution is narrower:
+**the same discipline applied to Python's vulnerability classes, with the
+verdict reduced to a predicate.**
 
-| Capability | **PyHunt** | [VulnHunter](https://github.com/capitalone/VulnHunter)<br/><sub>Capital One</sub> | [claude-code-<br/>security-review](https://github.com/anthropics/claude-code-security-review)<br/><sub>Anthropic</sub> | [vulnhuntr](https://github.com/protectai/vulnhuntr)<br/><sub>Protect AI</sub> | [OpenAnt](https://knostic.ai/openant)<br/><sub>Knostic</sub> |
-|---|:---:|:---:|:---:|:---:|:---:|
-| **Executes a candidate exploit** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **Verdict computed outside the model** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **Fresh container per attempt, 3 unanimous runs** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **Refuses to run without VM/gVisor isolation** | ✅ | n/a | n/a | n/a | n/a |
-| **Runtime observation via PEP-578 audit hooks** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Adversarial falsification of its own findings | ✅ | ✅ | ❌ | ❌ | ✅ |
-| Falsification forced onto a different model | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Entry-point-forward reasoning | ✅ | ✅ | ❌ | ✅ | ✅ |
-| Deterministic AST call graph | ✅ | ✅ | ❌ | ✅ | ❌ |
-| Completeness ledger with honest denominators | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Whole-repository scan | ✅ | ✅ | ❌ | ✅ | ✅ |
-| Pull-request / diff review | ❌ | ❌ | ✅ | ❌ | ❌ |
-| Generates and verifies fixes | ❌ | ✅ | ❌ | ❌ | ❌ |
-| Languages beyond Python | ❌ | ✅ | ✅ | ✅ | ✅ |
-| Runs unattended in CI | ❌ | ❌ | ✅ | ✅ | ✅ |
+| | **PyHunt** | [defending-code-<br/>reference-harness](https://github.com/anthropics/defending-code-reference-harness)<br/><sub>Anthropic</sub> | [VulnHunter](https://github.com/capitalone/VulnHunter)<br/><sub>Capital One</sub> |
+|---|:---|:---|:---|
+| **Delivered as** | Claude Code skill — `/pyhunt` | skills + an autonomous CLI pipeline | Claude Code skill — `/vulnhunt` |
+| **Target classes** | injection, deserialization, SSRF, path traversal, secrets | memory safety — C/C++, portable via `/customize` | broad, multi-language |
+| **The oracle** | PEP-578 audit hooks + frame attribution | ASAN crash under an instrumented build | none — settled by argument |
 
-<sub>Read against the projects themselves rather than their marketing.
-VulnHunter's verifier is documented as running with "**no Bash execution, no
-network access**"; OpenAnt's Stage 2 is LLM attacker-persona simulation rather
-than runtime execution; Anthropic's action reviews diffs inside a GitHub
-workflow. `n/a` marks rows that cannot apply because the tool never executes
-anything.</sub>
+### Does it settle a finding by running it?
 
-**Read the trade honestly.** PyHunt is Python-only, generates no fixes, and
-cannot run unattended — three columns where the alternatives are simply better.
-It buys one thing with those losses: when it says `proven`, a container observed
-the target's own frame interpret the payload, three times over.
+| | PyHunt | Anthropic harness | VulnHunter |
+|---|:---:|:---:|:---:|
+| Executes a candidate exploit | ✅ | ✅ | ❌ |
+| Fresh container the finder never touched | ✅ | ✅ | n/a |
+| Only the PoC crosses that boundary, not the reasoning | ✅ | ✅ | n/a |
+| Repeats until unanimous | ✅ <sub>3 of 3</sub> | ✅ <sub>3 of 3</sub> | n/a |
+| Network-isolated execution | ✅ | ✅ <sub>egress allowlist</sub> | n/a |
+| Gated on verified sandbox isolation | ✅ | ✅ | n/a |
+| …with **no override** | ✅ | ❌ <sub>explicit override exists</sub> | n/a |
+| Final verdict is a code predicate, not an agent | ✅ | ❌ <sub>a grader agent judges</sub> | ❌ |
+| Discriminates a *defended* sink from an exploited one | ✅ | n/a <sub>a crash is a crash</sub> | ❌ |
+
+### How it decides a finding is real
+
+| | PyHunt | Anthropic harness | VulnHunter |
+|---|:---:|:---:|:---:|
+| Second pass over its own findings | ✅ <sub>adversarial disproof</sub> | ✅ <sub>grade, then judge</sub> | ✅ <sub>falsification engine</sub> |
+| Second pass forced onto a *different* model | ✅ | ❌ | ❌ |
+| Deterministic AST call graph | ✅ | ❌ <sub>agent-driven recon</sub> | ✅ |
+| Completeness ledger with honest denominators | ✅ | ❌ <sub>focus-area partitioning</sub> | ❌ |
+| Duplicate suppression across parallel agents | ✅ | ✅ | ✅ |
+
+### Scope and operation
+
+| | PyHunt | Anthropic harness | VulnHunter |
+|---|:---:|:---:|:---:|
+| Threat-modelling stage | ❌ | ✅ | ❌ |
+| Generates fixes | ❌ | ✅ | ✅ |
+| Independently verifies a fix | ❌ | ✅ | ✅ |
+| Detection & response track | ❌ | ✅ | ❌ |
+| Runs autonomously, unattended | ❌ | ✅ | ❌ |
+| Languages beyond Python | ❌ | ✅ | ✅ |
+| Maintained | ✅ | ❌ <sub>stated in its README</sub> | ✅ |
+
+<sub>Read against the projects themselves, not their marketing. The Anthropic
+harness runs each agent in a gVisor container with egress restricted to the
+Claude API, has its find agent iterate "until an input crashes 3 out of 3
+times", and passes **only the PoC bytes** from the find container to a grader
+in a fresh container "so the grader isn't influenced by the find agent's
+reasoning" — the same seam PyHunt enforces. VulnHunter's verifier is documented
+as running with "no Bash execution, no network access": it settles findings by
+argument, deliberately, so the execution rows do not apply to it.</sub>
+
+**Where PyHunt actually differs.** Two places, both narrow:
+
+1. **The oracle sees different bugs.** ASAN observes memory corruption; it
+   cannot see `subprocess.run(shell=True)` reach a shell. Audit hooks observe
+   interpreter-level sinks; they cannot see a heap overflow. These are
+   complementary tools, not competing ones.
+2. **The verdict is a predicate, not a judgement.** The harness's grader is an
+   agent deciding whether a crash is real. PyHunt's gate is Python: five
+   conditions, eight enumerated outcomes, no model in the loop. That buys the
+   ability to discriminate a *defended* sink from an exploited one — a
+   distinction that has no meaning in a crash-based oracle, and the reason
+   condition 5 exists.
+
+**And where it is simply behind.** No threat modelling, no patch generation, no
+fix verification, no detection-and-response track, no autonomous operation, and
+one language. Anyone choosing between them for a C/C++ codebase should use the
+Anthropic harness.
 
 ---
 
@@ -269,41 +315,61 @@ python3 pyhunt/scripts/sandbox.py up --help     # provision a target image
 ## The run
 
 ```mermaid
-mindmap
-  root((PyHunt run))
-    Phase 0 Preflight
-      Authorisation confirmed
-      Majority-Python gate
-      Isolation tier detected
-      Static or Proof decided
-    Phase 1 Recon
-      Every untrusted input enumerated
-      Git history mined for past fixes
-      Completeness ledger opened
-    Phase 1b Taint
-      Deterministic AST call graph
-      Entry to sink paths
-      Narrow hunt tasks generated
-    Phase 2 Hunt
-      One attack class per agent
-      One location per agent
-      One finding per site
-    Phase 2b Prove
-      PoC written
-      Fresh container three times
-      Gate returns the verdict
-    Phase 2c Verify
-      Adversarial disproof
-      Forced onto a different model
-      Findings die here or nowhere
-    Phase 3 Sweep
-      Sibling instances found
-      Input dispositions settled
-      Honest denominators fixed
-    Phase 4 Report
-      CVSS from real reachability
-      Precision or not computed
-      Caveats stated in full
+%%{init: {"theme":"base","themeVariables":{"background":"#0d1117","primaryColor":"#161b22","primaryTextColor":"#ffffff","primaryBorderColor":"#3d444d","lineColor":"#6e7681","secondaryColor":"#1c2128","tertiaryColor":"#21262d","mainBkg":"#161b22","textColor":"#ffffff","nodeTextColor":"#ffffff","edgeLabelBackground":"#161b22","fontSize":"13px"},"flowchart":{"curve":"basis","nodeSpacing":16,"rankSpacing":70}}}%%
+flowchart LR
+    ROOT(("PyHunt<br/>run"))
+
+    ROOT --> S1["1 · Prepare"]
+    ROOT --> S2["2 · Discover"]
+    ROOT --> S3["3 · Prove"]
+    ROOT --> S4["4 · Settle"]
+
+    S1 --> P0["Phase 0<br/>Preflight"]
+    P0 --> P0a["Authorisation confirmed"]
+    P0 --> P0b["Majority-Python gate"]
+    P0 --> P0c["Isolation tier detected"]
+    P0 --> P0d["Static or Proof decided"]
+
+    S2 --> P1["Phase 1<br/>Recon"]
+    P1 --> P1a["Untrusted inputs enumerated"]
+    P1 --> P1b["Git history mined"]
+    P1 --> P1c["Completeness ledger opened"]
+    S2 --> PT["Phase 1b<br/>Taint"]
+    PT --> PTa["Deterministic AST call graph"]
+    PT --> PTb["Entry to sink paths"]
+    PT --> PTc["Narrow hunt tasks generated"]
+
+    S3 --> P2["Phase 2<br/>Hunt"]
+    P2 --> P2a["One class per agent"]
+    P2 --> P2b["One location per agent"]
+    P2 --> P2c["One finding per site"]
+    S3 --> PB["Phase 2b<br/>Prove"]
+    PB --> PBa["PoC written"]
+    PB --> PBb["Three fresh containers"]
+    PB --> PBc["Gate returns the verdict"]
+    S3 --> PV["Phase 2c<br/>Verify"]
+    PV --> PVa["Adversarial disproof"]
+    PV --> PVb["Different model required"]
+    PV --> PVc["Findings die here or nowhere"]
+
+    S4 --> P3["Phase 3<br/>Sweep"]
+    P3 --> P3a["Sibling instances found"]
+    P3 --> P3b["Dispositions settled"]
+    P3 --> P3c["Denominators made honest"]
+    S4 --> P4["Phase 4<br/>Report"]
+    P4 --> P4a["CVSS from real reachability"]
+    P4 --> P4b["Precision or not computed"]
+    P4 --> P4c["Caveats stated in full"]
+
+    classDef root fill:#1a2333,stroke:#5a8ac6,stroke-width:2px,color:#ffffff
+    classDef stage fill:#1c2431,stroke:#5a8ac6,color:#ffffff
+    classDef phase fill:#1b222c,stroke:#4d5866,color:#ffffff
+    classDef leaf fill:#14181f,stroke:#39414d,color:#c9d1d9
+
+    class ROOT root
+    class S1,S2,S3,S4 stage
+    class P0,P1,PT,P2,PB,PV,P3,P4 phase
+    class P0a,P0b,P0c,P0d,P1a,P1b,P1c,PTa,PTb,PTc,P2a,P2b,P2c,PBa,PBb,PBc,PVa,PVb,PVc,P3a,P3b,P3c,P4a,P4b,P4c leaf
 ```
 
 Phase 2b is where the design earns its keep. `scripts/replay.py` writes the PoC
@@ -321,22 +387,28 @@ Five conditions, all checked in Python by
 [`pyhunt/scripts/oracle/`](pyhunt/scripts/oracle/):
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"background":"#0d1117","primaryColor":"#161b22","primaryTextColor":"#ffffff","primaryBorderColor":"#3d444d","lineColor":"#9aa4b2","secondaryColor":"#1c2128","tertiaryColor":"#21262d","mainBkg":"#161b22","textColor":"#ffffff","nodeTextColor":"#ffffff","edgeLabelBackground":"#161b22","fontSize":"14px"}}}%%
 flowchart TD
-    S(["replay finished"]) --> C1{"1. Observer armed?"}
+    S(["replay finished"]) --> C1{"1 · Observer armed?"}
     C1 -->|no| O6(["observer_absent"])
-    C1 -->|yes| C2{"2. Watched audit<br/>event fired?"}
+    C1 -->|yes| C2{"2 · Watched audit<br/>event fired?"}
     C2 -->|no| O5(["no_event"])
-    C2 -->|yes| C3{"3. Carried this<br/>PoC's nonce?"}
+    C2 -->|yes| C3{"3 · Carried this<br/>PoC's nonce?"}
     C3 -->|no| O4(["nonce_mismatch"])
-    C3 -->|yes| C4{"4. Frame inside the<br/><b>target</b>, not the PoC?"}
+    C3 -->|yes| C4{"4 · Frame inside the<br/>target, not the PoC?"}
     C4 -->|no| O3(["self_attributed"])
-    C4 -->|yes| C5{"5. Payload <b>interpreted</b>,<br/>not merely carried?"}
+    C4 -->|yes| C5{"5 · Payload interpreted,<br/>not merely carried?"}
     C5 -->|no| O2(["sink_reached_unproven"])
-    C5 -->|yes| O1(["<b>proven</b>"])
+    C5 -->|yes| O1(["proven"])
 
-    style O1 fill:#eefaf0,stroke:#3fa15c
-    style O3 fill:#fdeaea,stroke:#c0392b
-    style O4 fill:#fdeaea,stroke:#c0392b
+    classDef step fill:#161b22,stroke:#3d444d,color:#ffffff
+    classDef fail fill:#241a1d,stroke:#8f4a52,color:#ffffff
+    classDef hard fill:#2a1215,stroke:#b3474f,color:#ffffff
+    classDef good fill:#12261c,stroke:#2ea043,color:#ffffff
+    class S,C1,C2,C3,C4,C5 step
+    class O5,O6,O2 fail
+    class O3,O4 hard
+    class O1 good
 ```
 
 Condition 5 exists because an end-to-end test caught the gate promoting a
@@ -362,22 +434,27 @@ finding, and nothing demotes one.**
 ## Isolation tiers
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"background":"#0d1117","primaryColor":"#161b22","primaryTextColor":"#ffffff","primaryBorderColor":"#3d444d","lineColor":"#9aa4b2","secondaryColor":"#1c2128","tertiaryColor":"#21262d","mainBkg":"#161b22","textColor":"#ffffff","nodeTextColor":"#ffffff","edgeLabelBackground":"#161b22","fontSize":"14px"}}}%%
 flowchart LR
     D["sandbox.py detect"] --> Q1{"Docker usable?"}
-    Q1 -->|no| T0["<b>none</b>"]
+    Q1 -->|no| T0["none"]
     Q1 -->|yes| Q2{"runsc runtime?"}
-    Q2 -->|yes| TG["<b>gvisor</b><br/>syscall interception"]
+    Q2 -->|yes| TG["gvisor<br/>syscall interception"]
     Q2 -->|no| Q3{"Separate kernel?"}
-    Q3 -->|yes| TV["<b>vm</b><br/>kernel in a VM"]
-    Q3 -->|no| TR["<b>runc</b><br/>shared kernel"]
+    Q3 -->|yes| TV["vm<br/>kernel in a VM"]
+    Q3 -->|no| TR["runc<br/>shared kernel"]
 
     TG --> A(["Proof allowed"])
     TV --> A
     TR --> R(["refused"])
     T0 --> R
 
-    style A fill:#eefaf0,stroke:#3fa15c
-    style R fill:#fdeaea,stroke:#c0392b
+    classDef step fill:#161b22,stroke:#3d444d,color:#ffffff
+    classDef good fill:#12261c,stroke:#2ea043,color:#ffffff
+    classDef bad fill:#2a1215,stroke:#b3474f,color:#ffffff
+    class D,Q1,Q2,Q3 step
+    class TG,TV,A good
+    class TR,T0,R bad
 ```
 
 | Tier | Condition | Boundary | Proof mode |
