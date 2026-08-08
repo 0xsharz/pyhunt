@@ -1,0 +1,65 @@
+# PyHunt is a Claude Code SKILL, not a Python distribution.
+#
+# It used to be both: an installable package with a `pyhunt` console script
+# driving an Agent SDK orchestrator. That shape is gone (decision D-2 — no
+# standalone CLI), and with it the console script, the runner's dependencies
+# (claude-agent-sdk, click, pydantic, rich, python-dotenv), and the package
+# layout that shipped them.
+#
+# What survives here is the DEVELOPMENT workflow. The skill itself is installed
+# by ./install.sh, which copies pyhunt/ into ~/.claude/skills/ and builds the
+# bundled venv its scripts resolve through scripts/_bootstrap.py. Nothing in
+# this file is required for the skill to run.
+#
+#   Dev setup:   python3.11 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+#   Tests:       .venv/bin/pytest
+#   Install:     ./install.sh
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyhunt"
+version = "0.2.0"
+description = "PyHunt — a Claude Code skill for Python vulnerability discovery with gated, executed proof-of-concept validation"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+# The skill's own runtime dependencies, declared here ONLY so that a dev
+# checkout gets the same two libraries the bundled venv has. install.sh pins
+# the same pair; the skill's scripts import nothing else from PyPI.
+dependencies = [
+    "jsonschema>=4.21",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+# There is no importable `pyhunt` package any more. `pyhunt/` is the skill
+# directory — SKILL.md, phases/, references/, schemas/, scripts/ — and its
+# Python is a set of scripts that import each other by bare name with
+# `scripts/` on sys.path, never as a package. Declaring no packages keeps
+# `pip install -e ".[dev]"` working as a dependency installer without
+# pretending a distribution exists.
+[tool.setuptools]
+packages = []
+py-modules = []
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests", "bench"]
+# bench_workdir holds benchmark target clones (gitignored). Those repos carry
+# their own tests/ and conftest.py, which pytest would otherwise collect and
+# then reject with ImportPathMismatchError against our own tests/conftest.py.
+norecursedirs = ["bench/bench_workdir", "*/bench_workdir", ".venv", "old"]
+# The skill's scripts import their siblings by bare name, because `scripts/` is
+# sys.path[0] when Claude Code runs one directly. Putting it on the path here
+# lets a test call those functions in-process (`import findings_io`) instead of
+# shelling out to a subprocess for every assertion.
+pythonpath = ["pyhunt/scripts"]

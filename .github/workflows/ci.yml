@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# What the published repository can verify is the product: that the skill
+# installs cleanly on a supported interpreter, that its scripts import and run,
+# and that the attribution required by Apache-2.0 travels with the install.
+jobs:
+  install:
+    name: Install on Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Byte-compile every script
+        run: python -m compileall -q pyhunt/scripts
+
+      - name: Install the skill
+        run: ./install.sh
+
+      - name: Skill landed where Claude Code looks for it
+        run: |
+          test -f "$HOME/.claude/skills/pyhunt/SKILL.md"
+          test -d "$HOME/.claude/skills/pyhunt/phases"
+          test -d "$HOME/.claude/skills/pyhunt/scripts"
+
+      - name: Attribution travelled with the install
+        # Apache-2.0 section 4(d): the NOTICE has to accompany the distributed
+        # work, and install.sh IS the distribution -- what it copies is the only
+        # PyHunt most operators will ever have.
+        run: |
+          test -f "$HOME/.claude/skills/pyhunt/NOTICE"
+          test -f "$HOME/.claude/skills/pyhunt/LICENSE"
+          test -d "$HOME/.claude/skills/pyhunt/licenses"
+
+      - name: Installed scripts run
+        run: |
+          python3 "$HOME/.claude/skills/pyhunt/scripts/sandbox.py" detect
+
+      - name: Re-running the installer is the upgrade path
+        # An installer that only works on a clean machine is not an upgrade
+        # path. This asserts idempotence rather than assuming it.
+        run: ./install.sh

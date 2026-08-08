@@ -1,0 +1,62 @@
+PyHunt
+Copyright 2026 the PyHunt authors.
+
+PyHunt is a Python-only fork of VASH (Vanguard Agentic Security Harness), which
+is itself derived from three prior works. Portions that carry an Apache-2.0
+header in-file are licensed under Apache-2.0; all other code is under the MIT
+License (see LICENSE). Full third-party license texts are in licenses/; the
+per-component attribution is below.
+
+What PyHunt changes relative to VASH: the analysis surface is restricted to
+Python (the JavaScript/TypeScript, Java, Go and C# PoC runtimes and their
+runtime observers are removed), and the decision that a proof-of-concept
+proved something moves out of the Hunt agent's judgement and into deterministic
+Python (pyhunt/scripts/oracle/), gated on a per-PoC nonce and on the observer's frame
+attribution.
+
+--------------------------------------------------------------------------------
+VASH (Vanguard Agentic Security Harness)  —  MIT License
+    Copyright 2026 the VASH authors.
+    The direct parent. PyHunt reuses substantially all of it: the 9-stage
+    pipeline, the deterministic AST call-graph spine and entry→sink taint
+    chunking, the provisioning subsystem, the static-first sandbox gate and the
+    runner's Bash-stripping invariant, the SQLite state and resume semantics,
+    the reporting layer, and the PEP-578 audit-hook observer
+    (pyhunt/scripts/observers/pyhunt_audit_hook.py, adapted to carry a nonce).
+    License: LICENSE (MIT)
+
+evilsocket/audit  —  MIT License
+    The base engine VASH forked, and therefore PyHunt's grandparent: the
+    original 8-stage pipeline (recon→hunt→validate→gapfill→dedupe→trace→
+    feedback→report), SQLite state, the Claude Agent SDK runner, cost
+    budgeting, and CLI.
+    License: licenses/audit-MIT.txt
+
+Capital One VulnHunter  —  Apache License 2.0  (Copyright Capital One)
+    Reused / adapted (not verbatim): the completeness input-inventory recon
+    pattern, the sink-backward audit modality, the per-class disprove-gates and
+    downgrade-discipline used in Validate, the benchmark miss-analysis harness,
+    and the graphify-based AST call-graph approach.
+    License: licenses/VulnHunter-Apache-2.0.txt
+
+Visa VVAH (visa-vulnerability-agentic-harness)  —  Apache License 2.0
+    Copyright 2026 VISA, Inc.
+    Reused VERBATIM (retain their Apache-2.0 headers): the CVSS 3.1 calculator
+    (pyhunt/scripts/cvss.py), the per-language security-hints knowledge base
+    (pyhunt/scripts/lang_hints.py), the repo-kind OWASP/CWE baselines
+    (pyhunt/scripts/baselines.py), and the secret/PII/PAN redaction module
+    (pyhunt/scripts/redact.py).
+    Adapted (not verbatim): deterministic entry→sink taint-path chunking, gated
+    specialist passes, catch-all coverage eligibility, exploit-chain
+    construction, the remediation policy hard-gates, the remediation diff
+    path-safety guard (rejecting absolute / `..` / drive / UNC targets), the
+    edit-then-diff remediation flow with its post-run revert of out-of-scope
+    edits (pyhunt-fix/scripts/remediation/), and the remediation prompt's authoritative fix
+    rules (pyhunt-fix/phases/remediate.md, adapted in part from
+    remediation_agent/prompts.py).
+    License: licenses/VVAH-Apache-2.0.txt
+
+Changes were made to all reused portions to adapt them to PyHunt's Python-only,
+gated-execution pipeline. This NOTICE file is provided per Apache-2.0 section
+4(d).
+--------------------------------------------------------------------------------

@@ -1,0 +1,44 @@
+# Build and interpreter artefacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Pre-restructure material and run artefacts, kept on disk, out of the ship tree.
+# See old/README.md for what is in there and why it was not deleted.
+old/
+
+# Toolchains and third-party checkouts that belong to this machine, not to
+# PyHunt. reference_projects/ holds user-local venvs and Go builds whose CLI
+# entrypoints are symlinked into ~/.local/bin — committing or moving it would
+# break that wiring.
+reference_projects/
+
+# Development material, kept on disk and out of the published product.
+#
+# The distributed artefact is the skill: pyhunt/, its installer, and the
+# attribution that has to travel with it. The test suite, the build plan, the
+# benchmark harness and the sample corpus are how the skill is developed and
+# how its claims are checked -- they are not part of what an operator installs,
+# and publishing scan output alongside a scanner invites the output to be read
+# as the product's advertisement.
+tests/
+plan/
+bench/
+corpus/
+SCAN-ISSUES.md
+
+# A PyHunt run writes its whole state beside the target it scanned.
+*_PYHUNT_RESULTS/
+*_PYHUNT_RESULTS_*/
+
+# Local secrets.
+.env
+
+# Running the test suite writes a graphify AST cache into the current working
+# directory.
+/graphify-out/

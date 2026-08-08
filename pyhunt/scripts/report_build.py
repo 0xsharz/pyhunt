@@ -1,0 +1,1491 @@
+"""Assemble ``report.json`` from a results directory. Every number, in Python.
+
+Phase 4 writes the advisory's prose. This module produces the object that prose
+describes, and the division is not stylistic: **no figure in the report may
+originate in a model.** Counts, CVSS scores, coverage denominators, the
+proven/provable split and the achieved isolation tier are all computed here,
+from files on disk, so a report cannot claim a scan did more than it did.
+
+That rule is inherited from the stage this module replaces. ``stages/report.py``
+handed the whole payload to a report agent and then *overwrote* the parts that
+mattered with values re-read from run state — a long sequence of ``_attach_*``
+calls, each with a comment explaining which disclosure the agent had dropped or
+misrepresented on a real run. Measured examples from that file's history:
+
+* five delivered findings, every one with a successful executed PoC, and **zero
+  observer lines anywhere in the report** — the agent never emitted ``poc``, so
+  the reproduction evidence that is this tool's entire differentiator was
+  invisible;
+* ``done=54 failed=1`` — one hunt task died to a repeated API error, meaning an
+  entire attack angle was never examined, and **nothing in the delivered report
+  said so**. The reader saw "source_files: 161, covered_files: 159" and would
+  reasonably have concluded the sweep was complete.
+
+Both are the same failure: silence reads as coverage. So every disclosure the
+old ``_attach_*`` helpers injected post-hoc is computed here up front, and the
+model never has the opportunity to leave one out.
+
+Two honest notes about what this build cannot know, stated here rather than
+emitted as a confident zero:
+
+* **There is no cost or token ledger.** That lived in the deleted runner's
+  SQLite ``costs`` table. ``scan_metrics`` therefore omits ``cost_usd`` and
+  ``tokens_by_phase`` rather than reporting them as 0.0.
+* **Task outcomes are only as good as ``tasks.json``.** If task records carry
+  no ``status``, coverage cannot be asserted complete, and the report says
+  exactly that instead of assuming success.
+
+Delivery selection, and the one place it deliberately overrules everything
+else: a finding whose execution gate returned ``proven`` is **always**
+delivered — not overridden by an adversarial verifier that rejected it, and
+not demoted by dedupe for losing a canonical coin-toss. The gate saw a
+nonce-attributed, target-framed, interpreted dangerous operation in this
+finding's own file. Nothing downstream gets to erase that; a disagreement is
+disclosed on the finding instead.
+
+Model prose enters through exactly one door, ``merge_narrative``, and it is a
+whitelist: ``title``/``description``/``impact``/``exploit_scenario``/
+``preconditions``/``how_to_fix``/``recommendation`` per finding, plus
+``threat_model``. Everything else in the payload is computed here, and a
+narrative that carries a computed field has it discarded and reported. The
+merge happens BEFORE redaction, so prose is masked like every other field.
+"""
+
+from __future__ import annotations
+
+import _bootstrap  # noqa: F401  (must precede any third-party import)
+
+import argparse
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import findings_io
+from json_utils import validate_schema
+from oracle import classes as vuln_classes
+from oracle.markers import MARKER as OBSERVER_MARKER
+from redact import redact_json
+
+# How much executed-PoC material the report carries per finding. The PoC code
+# is the reproduction recipe, so it is kept nearly whole. The observer marker
+# lines are the proof, so they are extracted separately and bounded generously
+# — by line count (``MAX_OBSERVER_MARKERS``) and by total characters
+# (``POC_OUTPUT_CHARS``), because a marker line's length is attacker-influenced
+# and an unbounded ``evidence`` string is an unbounded report. Both bounds
+# announce themselves in the rendered text when they bite: a truncation nobody
+# is told about would silently unprove the finding.
+POC_CODE_CHARS = 4000
+POC_OUTPUT_CHARS = 2000
+MAX_OBSERVER_MARKERS = 40
+
+#: The report fields phase 4's model owns, per the division-of-labour table in
+#: ``phases/phase4_report.md``. The narrative merge is a WHITELIST over these
+#: names and nothing else: a blacklist of computed fields would silently admit
+#: every field added to the schema later, which is how a model-authored number
+#: ends up in a report that promises none.
+NARRATIVE_FINDING_FIELDS = (
+    "title", "description", "impact", "exploit_scenario",
+    "preconditions", "how_to_fix", "recommendation",
+)
+
+#: Top-level narrative sections. ``threat_model`` is listed as the model's in
+#: the phase table, is renderable by ``reporting/markdown.py``, and has a home
+#: in ``report.schema.json`` — but nothing computed it, so before the narrative
+#: merge existed the Threat Model section rendered "_Not determined_" on every
+#: run of a tool whose whole point is describing what it found.
+NARRATIVE_TOP_LEVEL_FIELDS = ("threat_model",)
+
+#: Fields the report computes. A narrative that carries one is not merely
+#: ignored — it is reported, and under ``--strict`` it exits 2. The phase says
+#: "supplying one is still a bug, because it means you believed you were
+#: computing something you were not", and a bug nobody is told about is a bug
+#: that ships.
+COMPUTED_FINDING_FIELDS = ("cvss", "execution", "fingerprint", "variants",
+                           "validation", "confidence", "evidence", "trace")
+COMPUTED_TOP_LEVEL_FIELDS = ("summary", "coverage", "input_inventory",
+                             "scan_metrics", "verification")
+
+#: Fallback CWE by vulnerability class, used only when a finding carries no CWE
+#: of its own. Hunters emit one; findings that lost it reached CWE-matching
+#: scorers bare, which reads as "no weakness identified".
+CLASS_CWE = {
+    "code_injection": "CWE-94", "codegen": "CWE-94", "ssti": "CWE-94",
+    "logic_chain": "CWE-94", "codegen_injection": "CWE-94",
+    "docstring_injection": "CWE-94", "template_injection": "CWE-1336",
+    "command_injection": "CWE-78", "ssrf": "CWE-918", "path_traversal": "CWE-22",
+    "zip_slip": "CWE-22", "sql_injection": "CWE-89", "xxe": "CWE-611",
+    "deserialization": "CWE-502", "open_redirect": "CWE-601",
+    # Recon names the pickle/yaml variants separately; unmapped, they reached
+    # CWE-class scorers bare.
+    "deserialization_pickle": "CWE-502", "deserialization_yaml": "CWE-502",
+    "unsafe_reflection": "CWE-470", "eval_injection": "CWE-95",
+    "xss_stored": "CWE-79", "xss_reflected": "CWE-79",
+    "credential_leak": "CWE-200", "information_disclosure": "CWE-200",
+    "infoleak": "CWE-200", "header_injection": "CWE-113",
+    "race_condition": "CWE-362",
+    "uncontrolled_recursion_resource_exhaustion": "CWE-674",
+    "denial_of_service": "CWE-400", "algorithmic_complexity_dos": "CWE-407",
+}
+
+#: Baseline CVSS 3.1 (score, vector) by severity band. A backfill FLOOR for a
+#: finding that reached the report with no vector of its own — never an
+#: override. A real vector computed by ``validate_gates.apply_cvss`` from the
+#: verifier's own assessment always wins.
+CVSS_BASELINE = {
+    "critical": (9.8, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+    "high": (8.1, "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N"),
+    "medium": (5.3, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N"),
+    "low": (3.1, "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N"),
+    "informational": (0.0, "CVSS:3.1/AV:N/AC:H/PR:H/UI:R/S:U/C:N/I:N/A:N"),
+}
+
+#: The same bands for a target with **no network entry point** — a CLI, a
+#: library, a batch job.
+#:
+#: ``AV:N`` was applied unconditionally, so a code generator a developer runs
+#: over a file they chose was scored 9.8 with
+#: ``AV:N/AC:L/PR:N/UI:N``. Every term of that is wrong for such a target: the
+#: attacker is not on the network, and the victim must run the tool and then use
+#: its output. The honest vector is ``AV:L`` with ``UI:R``, which lands the same
+#: finding at 7.8 — still critical-adjacent, and defensible.
+#:
+#: Overstating severity is not a safe direction to err in. A report full of
+#: 9.8s trains its reader to discount the number, and the first real 9.8 is
+#: discounted with the rest.
+CVSS_BASELINE_LOCAL = {
+    "critical": (7.8, "CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H"),
+    "high": (7.3, "CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N"),
+    "medium": (4.4, "CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N"),
+    "low": (2.5, "CVSS:3.1/AV:L/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N"),
+    "informational": (0.0, "CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:N/I:N/A:N"),
+}
+
+#: Entry-point kinds that put an attacker on the network side of the target.
+#: Mirrors the gating `tasks.py` already applies to the access-control
+#: specialist, so the two cannot disagree about what "reachable" means.
+NETWORK_ENTRY_KINDS = frozenset({
+    "http_route", "rpc", "grpc", "webhook", "message_queue",
+})
+
+
+def network_reachable(inputs: dict | None) -> bool:
+    """Did recon enumerate any entry point an attacker reaches over a network?
+
+    Absent or unreadable inventory returns True — the network baseline is the
+    higher score, and guessing downward on missing evidence would quietly
+    deflate severities.
+    """
+    if not isinstance(inputs, dict):
+        return True
+    records = inputs.get("inputs")
+    if not isinstance(records, list) or not records:
+        return True
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        kind = str(record.get("kind") or "").strip().lower().replace("-", "_")
+        if kind in NETWORK_ENTRY_KINDS:
+            return True
+    return False
+
+DEFAULT_RECOMMENDATION = (
+    "Review the sink and add input validation / use a safe API."
+)
+
+#: Severity order used for tallies, so two runs over the same data produce
+#: byte-identical output.
+SEVERITY_ORDER = ("critical", "high", "medium", "low", "informational")
+
+
+# --------------------------------------------------------------------------
+# Classes THIS observer can never prove — the fourth denominator (L-2)
+# --------------------------------------------------------------------------
+#
+# `oracle/classes.py` holds two tables, and merging them is exactly the
+# dishonesty L-2 describes:
+#
+#   UNDECIDABLE_BY_EXECUTION      — no instrument could settle this. IDOR,
+#                                   access control, business logic: policy
+#                                   questions, and the runtime holds no policy.
+#   NOT_PROVABLE_BY_THIS_OBSERVER — execution COULD settle this; PyHunt's
+#                                   observer cannot see it. WATCHED_EVENTS has
+#                                   no DB-cursor and no response-write event,
+#                                   so SQL/NoSQL injection, XSS and open
+#                                   redirect can never reach `proven` here.
+#
+# `classes.is_undecidable` is the union, because the gate's answer is the same
+# for both (`not_applicable`, finding left standing). The REPORT must not merge
+# them: "no instrument could prove this" is a fact about the vulnerability
+# class, and "our instrument is deaf here" is a fact about PyHunt. Folding the
+# second into the first bills PyHunt's own blind spot to the target, and
+# folding either into `provable_by_execution` measures the tool against a
+# denominator containing findings it structurally cannot prove — understating
+# the tool and misleading the reader in the same breath.
+#
+# So the report calls `observer_blind_reason` and `undecidable_by_policy`
+# directly rather than `is_undecidable`, and publishes four numbers.
+#
+# Note what is deliberately NOT observer-blind: template injection. Jinja2 and
+# friends render through `compile(source, filename, "exec")`, which IS a
+# watched event, so a real SSTI reaches `proven` legitimately. That subtlety
+# lives in `oracle/classes.py` with the evidence for it; this module must not
+# keep a second opinion about the vocabulary.
+
+# --------------------------------------------------------------------------
+# Loading the results directory
+# --------------------------------------------------------------------------
+
+def _read_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return default
+
+
+def _task_outcomes(root: Path) -> dict[str, list[dict]]:
+    """``{task_id: [outcome, ...]}`` from ``task_outcomes.json``.
+
+    Imported lazily and defensively: `coverage.py` is the release gate and must
+    not be able to fail the report if it is mid-edit, and a report that cannot
+    read the outcome ledger should fall back to "unknown" rather than refuse to
+    build.
+    """
+    try:
+        from coverage import load_task_outcomes
+
+        return load_task_outcomes(root)
+    except Exception:  # pragma: no cover - defensive
+        return {}
+
+
+def load_run(results_dir: str | Path) -> dict:
+    """Everything the report is built from, read once.
+
+    Every file is optional. A run that stopped after phase 2 still gets a
+    report — a partial scan with disclosed gaps is useful; a scan that refuses
+    to report because one artifact is missing is not.
+    """
+    root = Path(results_dir)
+    return {
+        "results_dir": str(root),
+        "manifest": findings_io.load_manifest(root),
+        "findings": findings_io.load_findings(root),
+        "verifications": findings_io.load_verifications(root),
+        "proofs": findings_io.load_proofs(root),
+        "inputs": _read_json(root / "inputs.json", {}),
+        "coverage": _read_json(root / "coverage.json", {}),
+        "tasks": _read_json(root / "tasks.json", {}),
+        # Which queued tasks were actually hunted, and what they concluded.
+        # `tasks.json` is the queue and records no outcome, so without this a
+        # clean sweep and a task nobody ran are the same thing to the report.
+        # Written by `findings_io record` and `coverage.py task-done`.
+        "task_outcomes": _task_outcomes(root),
+        "preflight": _read_json(root / "preflight.json", {}),
+        "gaps": _read_json(root / "gaps.json", {}),
+        # Optional: phase 1 may record its architecture map separately from the
+        # input inventory. Absent is normal and costs only the subsystem
+        # breakdown.
+        "recon": _read_json(root / "recon.json", {}),
+    }
+
+
+# --------------------------------------------------------------------------
+# Delivery selection
+# --------------------------------------------------------------------------
+
+def is_canonical(finding: dict) -> bool:
+    """Is this finding its group's delivered representative?
+
+    An ungrouped finding is its own canonical: dedupe not having run is not a
+    reason to withhold a finding.
+    """
+    if finding.get("group_id"):
+        return bool(finding.get("is_canonical"))
+    return True
+
+
+def select_delivered(findings: list[dict], verifications: dict[str, dict]) -> tuple[list[dict], list[dict]]:
+    """Split findings into ``(delivered, withheld)``.
+
+    Withheld is not deleted: every withheld finding is counted in
+    ``coverage.findings_by_status`` and in the verification funnel, and each
+    carries the reason it was withheld. The report's headline count is the
+    delivered set; the denominators disclose the rest.
+
+    A finding the execution gate proved is never withheld — not by the
+    adversarial verifier, and not by dedupe. The gate observed the target's own
+    frame interpret this PoC's nonce-carrying payload; a model's later re-read
+    is an opinion about that observation, not a replacement for it.
+
+    The docstring and the code used to disagree here (L-1): ``proven`` was
+    computed and then not consulted on the canonicality branch, so a proven
+    finding that lost the canonical coin-toss to an UNPROVEN sibling was
+    demoted to a bare "Also at `file:line`" reference — losing its PoC, its
+    observer marker lines, its CVSS block and its execution outcome. The
+    headline then showed the finding with no receipt and hid the one with one.
+    That is the report equivalent of every other defect in this pass: the
+    evidence existed and the output did not show it.
+
+    The docstring was the intended contract, so the code now matches it.
+    Delivering a proven duplicate does not inflate the headline dishonestly —
+    the gate's locality check means a ``proven`` verdict is tied to that
+    finding's OWN file, so two proven siblings are two genuinely distinct
+    observed sites, not one fact counted twice. ``attach_variants`` is kept in
+    step: a finding delivered on its own merits is never also listed as
+    somebody else's "Also at" reference.
+    """
+    delivered: list[dict] = []
+    withheld: list[dict] = []
+    for finding in findings:
+        proven = findings_io.poc_succeeded(finding)
+        verdict = (verifications.get(finding["finding_id"]) or {}).get("verdict")
+        if proven:
+            delivered.append(finding)
+            continue
+        if not is_canonical(finding):
+            withheld.append({**finding, "_withheld_reason": "duplicate_of_canonical"})
+            continue
+        if verdict == "rejected":
+            withheld.append({**finding, "_withheld_reason": "verifier_rejected"})
+            continue
+        delivered.append(finding)
+    return delivered, withheld
+
+
+# --------------------------------------------------------------------------
+# The base payload
+# --------------------------------------------------------------------------
+
+def _report_description(finding: dict) -> str:
+    """A description that satisfies the report schema without inventing claims.
+
+    ``report.schema.json`` requires 30 characters; ``finding.schema.json``
+    requires 20. A hunter can therefore emit a valid finding whose description
+    is too short for the report. The gap is closed by appending the finding's
+    own location — factual, deterministic, and derived from fields already on
+    the record — rather than by asking a model to pad it or by dropping the
+    finding.
+    """
+    description = str(finding.get("description") or "").strip()
+    location = (
+        f"{finding.get('vuln_class')} at {finding.get('file')}:"
+        f"{finding.get('line_start')}-{finding.get('line_end')}"
+    )
+    if len(description) >= 30:
+        return description
+    if description:
+        return f"{description} ({location})"
+    return f"{location}. The hunter recorded no description for this finding."
+
+
+def _trace_for(finding: dict, tasks_by_id: dict[str, dict]) -> dict:
+    """The entry-point/call-chain block, from the task that raised the finding.
+
+    Two task shapes are supported on purpose. ``hunt_task.schema.json`` — what
+    ``taint.py`` actually emits today — has no structured path, only a prose
+    ``scope_hint`` naming the trust boundary above the sink. The results-dir
+    contract for ``tasks.json`` describes richer ``entry_point``/``path``
+    fields. Whichever is present is used; neither is fabricated when absent,
+    because an invented call chain is a claim about code nobody read.
+    """
+    task = tasks_by_id.get(finding.get("task_id") or "") or {}
+    entry_points: list[dict] = []
+    entry = task.get("entry_point")
+    if isinstance(entry, dict) and entry.get("location"):
+        entry_points.append({
+            "kind": str(entry.get("kind") or "entry_point"),
+            "location": str(entry["location"]),
+            **({"controllable_by": str(entry["controllable_by"])}
+               if entry.get("controllable_by") else {}),
+        })
+    elif isinstance(entry, str) and entry.strip():
+        entry_points.append({"kind": "entry_point", "location": entry.strip()})
+
+    call_chain: list[dict] = []
+    for hop in task.get("path") or []:
+        if isinstance(hop, dict) and hop.get("file") and hop.get("line"):
+            call_chain.append({
+                "file": str(hop["file"]),
+                "function": str(hop.get("function") or "?"),
+                "line": int(hop["line"]),
+            })
+    return {"entry_points": entry_points, "call_chain": call_chain}
+
+
+def build_report_payload(
+    run: dict, delivered: list[dict], tasks_by_id: dict[str, dict]
+) -> dict:
+    """The report skeleton: identity, tally, and one entry per delivered finding.
+
+    Everything richer than this — CWE, CVSS, PoC evidence, variants, coverage —
+    is attached afterwards from run state, so that a field's presence never
+    depends on a model having remembered to emit it.
+    """
+    manifest = run.get("manifest") or {}
+    by_severity: dict[str, int] = {}
+    findings_out = []
+    for finding in delivered:
+        severity = str(finding.get("severity") or "informational")
+        by_severity[severity] = by_severity.get(severity, 0) + 1
+        findings_out.append({
+            "finding_id": finding["finding_id"],
+            "title": f"{finding.get('vuln_class')} in {finding.get('file')}",
+            "severity": severity,
+            "vuln_class": str(finding.get("vuln_class") or "unknown"),
+            "file": str(finding.get("file") or ""),
+            "line_start": int(finding.get("line_start") or 1),
+            "line_end": int(finding.get("line_end") or finding.get("line_start") or 1),
+            "description": _report_description(finding),
+            "evidence": str(finding.get("evidence_snippet") or ""),
+            "trace": _trace_for(finding, tasks_by_id),
+            "recommendation": DEFAULT_RECOMMENDATION,
+        })
+
+    target: dict[str, str] = {"repo_path": str(manifest.get("target") or "")}
+    if manifest.get("commit"):
+        target["commit"] = str(manifest["commit"])
+
+    return {
+        "run_id": str(manifest.get("run_id") or Path(run["results_dir"]).name),
+        "target": target,
+        "summary": {
+            "total": len(findings_out),
+            "by_severity": {
+                sev: by_severity[sev] for sev in SEVERITY_ORDER if sev in by_severity
+            },
+        },
+        "findings": findings_out,
+    }
+
+
+# --------------------------------------------------------------------------
+# The attaches — each one a disclosure the report must never be able to drop
+# --------------------------------------------------------------------------
+
+def attach_cwe(payload: dict, findings_by_id: dict[str, dict]) -> None:
+    """Backfill a ``cwe`` onto each report finding.
+
+    Prefer the finding's own CWE from run state; else map from ``vuln_class``.
+    Without this, a CWE-class-matching consumer (SARIF, a benchmark scorer)
+    sees a bare finding and cannot class it at all.
+    """
+    for entry in payload.get("findings", []):
+        if entry.get("cwe"):
+            continue
+        stored = findings_by_id.get(entry["finding_id"]) or {}
+        cwe = stored.get("cwe") or CLASS_CWE.get(entry.get("vuln_class") or "")
+        if cwe:
+            entry["cwe"] = cwe
+
+
+def observer_markers(run_output: str | None) -> list[str]:
+    """The observer evidence lines from a PoC's output.
+
+    These are the record that the dangerous operation was actually *seen* to
+    happen — a process spawned, a socket opened — as opposed to a PoC that
+    merely exited 0. When a finding is proven, one of these lines is the proof,
+    and the report must quote it.
+    """
+    return [
+        line.strip()
+        for line in (run_output or "").splitlines()
+        if OBSERVER_MARKER in line
+    ][:MAX_OBSERVER_MARKERS]
+
+
+def replay_transcript(proof: dict | None) -> str:
+    """The observer transcript out of a ``proof/<id>.json`` record.
+
+    ``replay.ProofRecord.to_dict()`` writes **no top-level ``run_output``**: the
+    captured text lives per repeat, under ``runs[i]["markers"]`` (the signed
+    private channel the gate judged) with ``stdout``/``stderr`` beside it. This
+    module used to read ``proof["run_output"]``, so the documented preference
+    for the replay transcript over the hunter's own account never once fired —
+    every "Observer evidence" block in every report was quoting text the hunt
+    agent wrote. That is defect C-1 wearing the report's clothes.
+
+    ``markers`` is preferred over ``stdout``/``stderr`` because it is the
+    channel Contract A signs; the others are included after it so a stderr
+    fallback still yields evidence. ``run_output`` is still honoured when
+    present, for records written by something other than ``replay.py``.
+    """
+    if not isinstance(proof, dict) or not proof:
+        return ""
+    if proof.get("run_output"):
+        return str(proof["run_output"])
+    chunks: list[str] = []
+    for run in proof.get("runs") or []:
+        if not isinstance(run, dict):
+            continue
+        for key in ("markers", "stdout", "stderr"):
+            text = run.get(key)
+            if text:
+                chunks.append(str(text))
+    return "\n".join(chunks)
+
+
+def bounded_marker_block(markers: list[str]) -> str:
+    """The observer marker lines as one text block, bounded and loud about it.
+
+    ``MAX_OBSERVER_MARKERS`` bounds the line COUNT; nothing bounded the line
+    LENGTH, and a marker line's contents are influenced by whatever the PoC
+    passed to the dangerous operation. One pathological argument therefore put
+    an arbitrarily large string into a schema field with no maximum, in a
+    document that is redacted and re-serialised whole.
+
+    Every truncation announces itself in the rendered text. A silent one would
+    be the worst possible bug in this specific function: these lines ARE the
+    proof, and quietly dropping the one that carried the attribution would
+    unprove the finding while leaving the report looking complete.
+    """
+    kept: list[str] = []
+    truncated_lines = 0
+    used = 0
+    for line in markers:
+        clipped = line[:POC_OUTPUT_CHARS]
+        if clipped != line:
+            truncated_lines += 1
+        if kept and used + len(clipped) + 1 > POC_OUTPUT_CHARS:
+            break
+        kept.append(clipped)
+        used += len(clipped) + 1
+
+    body = "\n".join(kept)
+    notes: list[str] = []
+    dropped = len(markers) - len(kept)
+    if dropped:
+        notes.append(
+            f"{dropped} further observer line(s) omitted here — the block "
+            f"exceeded {POC_OUTPUT_CHARS} characters"
+        )
+    if truncated_lines:
+        notes.append(
+            f"{truncated_lines} line(s) were individually longer than "
+            f"{POC_OUTPUT_CHARS} characters and were cut"
+        )
+    if notes:
+        body += (
+            "\n[... " + "; ".join(notes)
+            + ". The complete transcript is in proof/<finding_id>.json.]"
+        )
+    return body
+
+
+def attach_poc_evidence(
+    payload: dict, findings_by_id: dict[str, dict], proofs: dict[str, dict]
+) -> None:
+    """Attach each finding's executed-PoC evidence.
+
+    A confirmed PyHunt finding was not merely reasoned about: a real PoC was
+    written and run in the sandbox, and a runtime observer recorded the
+    dangerous operation as it fired. If that evidence does not reach the
+    report, the tool's differentiator is invisible in its only output.
+
+    The replay transcript (phase 2b, ``proof/<id>.json``) is preferred over the
+    hunter's own account when both exist — the replay is the run the gate
+    actually judged, and only the PoC crossed into that container.
+
+    ``poc.succeeded`` in the report is the GATE's value, never the model's.
+    """
+    for entry in payload.get("findings", []):
+        finding = findings_by_id.get(entry["finding_id"])
+        if finding is None:
+            continue
+        proof = proofs.get(entry["finding_id"]) or {}
+        poc = dict(finding.get("poc") or {})
+        # The replay transcript when there is one, the hunter's account only
+        # when there is not. `replay_transcript` is what makes that preference
+        # real — reading `proof["run_output"]` directly never found anything.
+        run_output = replay_transcript(proof) or str(poc.get("run_output") or "")
+        if not poc.get("code"):
+            continue
+        block: dict[str, Any] = {
+            "language": str(poc.get("language") or "python"),
+            "code": str(poc.get("code"))[:POC_CODE_CHARS],
+            "succeeded": findings_io.poc_succeeded(finding),
+        }
+        entry["poc"] = block
+        # `run_output`, `notes` and `observer_evidence` are not in
+        # report.schema.json's `poc` block (which allows only
+        # language/code/succeeded), so the marker lines ride in `evidence`
+        # instead of being silently dropped: they are the proof, and the
+        # renderer must be able to quote them.
+        markers = observer_markers(run_output)
+        if markers:
+            entry["evidence"] = (
+                f"{entry.get('evidence', '')}\n\n"
+                f"Observer evidence ({len(markers)} line(s)):\n"
+                + bounded_marker_block(markers)
+            ).strip()
+
+
+def group_members_excluding(
+    group: list[dict],
+    exclude_id: str,
+    *,
+    delivered_ids: frozenset[str] | set[str] = frozenset(),
+) -> list[dict]:
+    """Located references to a finding's deduped siblings ("Also at:").
+
+    A deduped sibling is demoted to a LOCATED reference, never dropped, so
+    every co-located confirmed site stays visible without inflating the
+    headline count.
+
+    Dedupe may promote one canonical PER FILE in a cross-file group, so a group
+    can have several headline findings. A sibling belongs in ``exclude_id``'s
+    variants only if it is genuinely demoted AND it is actually *this*
+    canonical's demoted sibling: either it shares this canonical's file, or (the
+    single-canonical case) no other canonical in the group claims its file at
+    all. Without that test, every headline in a multi-canonical group would
+    list every other headline's duplicates too.
+
+    ``delivered_ids`` names the findings that got their own headline entry.
+    Since the L-1 fix, a non-canonical finding the gate PROVED is delivered on
+    its own merits, so "not canonical" no longer implies "demoted". A delivered
+    finding listed here would appear twice in the same report — once with its
+    evidence, once as a bare location — so it is excluded.
+    """
+    exclude_file = next(
+        (f.get("file") for f in group if f.get("finding_id") == exclude_id), None
+    )
+    canonical_files = {f.get("file") for f in group if f.get("is_canonical")}
+    return [
+        {
+            "finding_id": f.get("finding_id"),
+            "file": f.get("file"),
+            "line_start": f.get("line_start"),
+            "line_end": f.get("line_end"),
+            "vuln_class": f.get("vuln_class"),
+        }
+        for f in group
+        if f.get("finding_id") != exclude_id
+        and not f.get("is_canonical")
+        and f.get("finding_id") not in delivered_ids
+        and (f.get("file") == exclude_file or f.get("file") not in canonical_files)
+    ]
+
+
+def attach_variants(payload: dict, findings: list[dict]) -> None:
+    """Attach located deduped-sibling references to each report finding.
+
+    The delivered set is read off ``payload["findings"]`` rather than passed in:
+    those entries ARE the delivered findings, so the two can never drift apart
+    and no caller has to remember to keep them in sync.
+    """
+    groups: dict[str, list[dict]] = {}
+    for finding in findings:
+        gid = finding.get("group_id")
+        if gid:
+            groups.setdefault(gid, []).append(finding)
+    by_id = {f["finding_id"]: f for f in findings}
+    delivered_ids = frozenset(
+        str(e["finding_id"]) for e in payload.get("findings", []) if e.get("finding_id")
+    )
+    for entry in payload.get("findings", []):
+        gid = (by_id.get(entry["finding_id"]) or {}).get("group_id")
+        if not gid:
+            continue
+        variants = group_members_excluding(
+            groups.get(gid, []), entry["finding_id"], delivered_ids=delivered_ids
+        )
+        if variants:
+            entry["variants"] = variants
+
+
+def attach_validation(
+    payload: dict, findings_by_id: dict[str, dict], verifications: dict[str, dict]
+) -> None:
+    """Attach each finding's adversarial-verification outcome and the hunter's
+    own confidence.
+
+    Only the keys the verifier actually emitted are copied — a
+    ``needs_more_info`` verdict carries no ``cvss_vector``, and inventing one
+    would make an unresolved finding look assessed.
+    """
+    for entry in payload.get("findings", []):
+        finding = findings_by_id.get(entry["finding_id"]) or {}
+        verification = verifications.get(entry["finding_id"]) or {}
+        block: dict[str, Any] = {}
+        if verification.get("verdict"):
+            block["verdict"] = verification["verdict"]
+        if "rationale" in verification:
+            block["rationale"] = verification["rationale"]
+        if "validator_confidence" in verification:
+            block["validator_confidence"] = verification["validator_confidence"]
+        if block:
+            entry["validation"] = block
+        if finding.get("confidence") is not None:
+            entry["confidence"] = finding["confidence"]
+
+
+def attach_cvss(payload: dict, verifications: dict[str, dict],
+                inputs: dict | None = None) -> None:
+    """Give every report finding a CVSS block.
+
+    Priority: the vector the verifier assessed (with the score computed in
+    Python by ``validate_gates.apply_cvss``), then a severity-keyed baseline
+    floor. The baseline never overwrites a real vector — a generic 9.8 standing
+    in for an assessed 7.5 is a wrong number presented with the same authority
+    as a right one.
+
+    The baseline's **attack vector is chosen from the inventory**, not assumed.
+    When recon enumerated no network entry point, ``AV:L``/``UI:R`` is used, so
+    a CLI code generator is not scored as though an unauthenticated stranger
+    could reach it across the internet. See :data:`CVSS_BASELINE_LOCAL`.
+    """
+    table = CVSS_BASELINE if network_reachable(inputs) else CVSS_BASELINE_LOCAL
+    for entry in payload.get("findings", []):
+        if entry.get("cvss"):
+            continue
+        verification = verifications.get(entry["finding_id"]) or {}
+        vector = verification.get("cvss_vector")
+        score = verification.get("cvss_score")
+        if vector and score is not None:
+            entry["cvss"] = {
+                "score": score,
+                "severity": entry.get("severity"),
+                "vector": vector,
+            }
+            continue
+        baseline_score, baseline_vector = table.get(
+            str(entry.get("severity") or "").lower(), (0.0, "")
+        )
+        entry["cvss"] = {
+            "score": baseline_score,
+            "severity": entry.get("severity"),
+            "vector": baseline_vector,
+        }
+
+
+def attach_input_inventory(payload: dict, inputs: dict, coverage: dict) -> None:
+    """Attach the resolved input inventory — the completeness ledger.
+
+    Every attacker-controllable input Recon enumerated appears here with the
+    disposition the sweep reconciled it to. This is what makes "we looked at
+    everything" checkable rather than asserted, and it is sourced from run
+    state so the report cannot quietly enumerate fewer inputs than the scan
+    found.
+    """
+    dispositions = {
+        str(row.get("input_id") or row.get("id")): row
+        for row in (coverage.get("inputs") or [])
+    }
+    inventory = []
+    for row in inputs.get("inputs") or []:
+        input_id = str(row.get("input_id") or row.get("id") or "")
+        resolved = dispositions.get(input_id, {})
+        inventory.append({
+            "id": input_id,
+            "source_type": row.get("source_type"),
+            "location": row.get("location"),
+            "variable": row.get("variable"),
+            "entry_point": row.get("entry_point"),
+            "trust_level": row.get("trust_level"),
+            "disposition": resolved.get("disposition"),
+            "disposition_evidence": resolved.get("evidence")
+            or resolved.get("disposition_evidence"),
+        })
+    payload["input_inventory"] = inventory
+
+
+def _parse_stamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def attach_scan_metrics(payload: dict, coverage: dict, manifest: dict) -> None:
+    """Attach run-level scan metrics.
+
+    A metric that is not knowable is OMITTED, never emitted as a cheerful zero.
+    Cost and per-phase tokens are unknowable in the skill form — they lived in
+    the deleted runner's SQLite ledger — so those two keys never appear, rather
+    than reporting a $0.00 scan.
+    """
+    files = coverage.get("files") if isinstance(coverage.get("files"), dict) else coverage
+    metrics: dict[str, Any] = {}
+    source_files = files.get("source_files")
+    covered_files = files.get("covered_files")
+    if isinstance(source_files, int):
+        metrics["files_in_scope"] = source_files
+    if isinstance(covered_files, int):
+        metrics["files_analyzed"] = covered_files
+    if isinstance(source_files, int) and isinstance(covered_files, int) and source_files:
+        metrics["coverage_pct"] = round(100 * covered_files / source_files, 1)
+    started = _parse_stamp(manifest.get("started_at"))
+    finished = _parse_stamp(manifest.get("finished_at"))
+    if started and finished:
+        metrics["duration_sec"] = round((finished - started).total_seconds(), 1)
+    if metrics:
+        payload["scan_metrics"] = metrics
+
+
+def attach_verification(
+    payload: dict, findings: list[dict], verifications: dict[str, dict]
+) -> None:
+    """Attach the verification funnel over EVERY finding the run recorded.
+
+    Not just the delivered ones. A precision figure computed over the survivors
+    is meaningless — it would be 100% by construction.
+    """
+    raw = len(findings)
+    verdicts = [
+        (verifications.get(f["finding_id"]) or {}).get("verdict") for f in findings
+    ]
+    confirmed = sum(1 for v in verdicts if v == "confirmed")
+    rejected = sum(1 for v in verdicts if v == "rejected")
+    judged = sum(1 for v in verdicts if v)
+
+    # **Precision is UNDEFINED when phase 2c did not run, and undefined is not
+    # zero.** With no verifications recorded, `confirmed` and `rejected` are
+    # both 0, and dividing gave `0.0` — so a run with three good findings and
+    # not one rejection reported "Verification precision: 0.0%", which reads as
+    # "everything here is junk". That is the same defect this project exists to
+    # prevent, pointed the other way: a number stated with more confidence than
+    # the evidence carries. The denominator is what was actually judged, and
+    # when nothing was judged the answer is None.
+    payload["verification"] = {
+        "raw_findings": raw,
+        "true_positives": confirmed,
+        "false_positives": rejected,
+        "needs_more_info": sum(1 for v in verdicts if v == "needs_more_info"),
+        "duplicates_collapsed": sum(
+            1 for f in findings if f.get("group_id") and not f.get("is_canonical")
+        ),
+        "findings_judged": judged,
+        "precision_pct": (
+            round(100 * confirmed / (confirmed + rejected), 1)
+            if (confirmed + rejected) else None
+        ),
+        "precision_note": (
+            "" if (confirmed + rejected) else
+            "adversarial verification (phase 2c) recorded no verdict for any "
+            "finding, so there is no confirmed/rejected split to take a ratio "
+            "of. This is not a precision of zero."
+        ),
+    }
+
+
+#: Rendered next to ``not_provable_by_observer``. Plain language, because the
+#: number is meaningless to a reader who does not know what an audit hook is.
+NOT_PROVABLE_BY_OBSERVER_NOTE = (
+    "These findings are in classes PyHunt's runtime observer has no event for. "
+    "It watches process spawn, file open, network connect, exec/compile, "
+    "pickle and marshal; CPython raises no audit event when a database cursor "
+    "executes a query or when a response body or header is written, so a fully "
+    "successful SQL injection, NoSQL injection, XSS or open redirect produces "
+    "nothing for the gate to attribute. They could not have reached 'proven' "
+    "however sound they are, so they are excluded from the provable "
+    "denominator rather than counted as failures to prove. This is a "
+    "limitation of PyHunt, not a weakness in the findings: they stand on their "
+    "static source-to-sink argument, and each one below carries the specific "
+    "reason its class is invisible here."
+)
+
+
+def execution_summary(findings: list[dict], manifest: dict) -> dict:
+    """proven / provable / not-provable-by-observer / total: four denominators.
+
+    A merged "18/25 confirmed" that buries six access-control findings in the
+    denominator is a misleading number: those six could never have been settled
+    by running code, so counting them as failures to prove understates the tool
+    and counting them as proven overstates it. Every denominator is published
+    separately, and none of them is derivable from another by subtraction alone.
+
+    The fourth number closes L-2. ``provable_by_execution`` used to be "total
+    minus ``not_applicable``", which counted SQL injection, NoSQL injection,
+    XSS and template injection as provable — classes ``WATCHED_EVENTS`` has no
+    event for and which therefore can never reach ``proven``. The tool was
+    measuring itself against a denominator containing findings it structurally
+    cannot prove: it understated its own hit rate AND told the reader those
+    findings had been tried and failed. Both halves were wrong.
+
+    The four buckets partition the findings exactly — they sum to ``total`` —
+    and are assigned in this precedence:
+
+    1. outcome ``proven`` -> provable. An observed fact outranks any table. A
+       template injection that escalated to a process spawn WAS witnessed, so
+       claiming its class is unobservable would contradict the evidence sitting
+       next to it in the report. This ordering is also what guarantees
+       ``proven <= provable``, an invariant a reader will assume and which a
+       table-first ordering could violate.
+    2. class is observer-blind -> not_provable_by_observer. Checked BEFORE the
+       ``not_applicable`` outcome, because the gate reaches that outcome via
+       ``classes.is_undecidable``, which is the UNION of the two tables — so an
+       outcome-first ordering would bury every observer-blind finding inside
+       ``not_applicable`` and the third number would always read 0. That is the
+       merge L-2 exists to prevent, one layer down.
+    3. outcome ``not_applicable``, or a policy-undecidable class -> not
+       applicable. No instrument could settle it.
+    4. everything else -> provable.
+
+    ``by_outcome`` keeps the eight gate outcomes distinct, plus ``ungated`` for
+    a finding the gate never saw. ``ungated`` is a PyHunt bug, not a fact about
+    the target, and folding it into ``not_attempted`` would hide it.
+    """
+    by_outcome: dict[str, int] = {}
+    provable = 0
+    not_applicable = 0
+    blind = 0
+    blind_classes: dict[str, int] = {}
+    blind_reasons: dict[str, str] = {}
+
+    for finding in findings:
+        outcome = findings_io.execution_outcome(finding) or "ungated"
+        by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
+
+        vuln_class = str(finding.get("vuln_class") or "unknown")
+        reason = vuln_classes.observer_blind_reason(vuln_class)
+        if outcome == "proven":
+            provable += 1
+        elif reason:
+            blind += 1
+            blind_classes[vuln_class] = blind_classes.get(vuln_class, 0) + 1
+            blind_reasons.setdefault(vuln_class, reason)
+        elif outcome == "not_applicable" or vuln_classes.undecidable_by_policy(
+            vuln_class
+        ):
+            not_applicable += 1
+        else:
+            provable += 1
+
+    summary: dict[str, Any] = {
+        "total": len(findings),
+        "provable_by_execution": provable,
+        "proven_by_execution": by_outcome.get("proven", 0),
+        "not_applicable": not_applicable,
+        "not_provable_by_observer": blind,
+        "ungated": by_outcome.get("ungated", 0),
+        "overclaimed": sum(1 for f in findings if findings_io.contradicts_model(f)),
+        "by_outcome": dict(sorted(by_outcome.items())),
+        "isolation_tier": manifest.get("isolation_tier"),
+        "mode": manifest.get("mode"),
+    }
+    if blind:
+        summary["not_provable_by_observer_note"] = NOT_PROVABLE_BY_OBSERVER_NOTE
+        summary["not_provable_by_observer_classes"] = dict(sorted(blind_classes.items()))
+        summary["not_provable_by_observer_reasons"] = dict(sorted(blind_reasons.items()))
+    return summary
+
+
+def attach_coverage(payload: dict, run: dict, withheld: list[dict]) -> None:
+    """Attach the consolidated coverage disclosure.
+
+    ``coverage_complete`` is False whenever anything is unaccounted for: an
+    enumerated input that never reached a disposition, a hunt task that failed
+    or never finished, files the sweep cap dropped, or — importantly — task
+    outcomes that were never recorded at all. An operator must never be told
+    coverage is complete when it is merely unmeasured.
+
+    The block also carries the execution summary and the preflight caveat.
+    ``report.schema.json`` deliberately leaves ``coverage`` permissive
+    (``additionalProperties`` allowed) so these disclosures have a schema-legal
+    home; a future schema revision should promote ``coverage.execution`` to a
+    top-level ``execution_summary``.
+    """
+    coverage_file = run.get("coverage") or {}
+    inputs = coverage_file.get("inputs") or []
+    totals = coverage_file.get("totals") or {}
+    tasks = (run.get("tasks") or {}).get("tasks") or []
+    verifications = run.get("verifications") or {}
+    findings = run.get("findings") or []
+
+    tasks_by_source: dict[str, int] = {}
+    for task in tasks:
+        source = str(task.get("source") or "unknown")
+        tasks_by_source[source] = tasks_by_source.get(source, 0) + 1
+
+    findings_by_status: dict[str, int] = {}
+    for finding in findings:
+        status = (verifications.get(finding["finding_id"]) or {}).get(
+            "verdict"
+        ) or "unverified"
+        findings_by_status[status] = findings_by_status.get(status, 0) + 1
+
+    coverage: dict[str, Any] = {
+        "inputs_enumerated": int(totals.get("enumerated", len(inputs))),
+        "inputs_covered": int(
+            totals.get("covered", sum(1 for i in inputs if i.get("disposition") == "covered"))
+        ),
+        "inputs_uncovered": int(
+            totals.get("uncovered", sum(1 for i in inputs if i.get("disposition") == "uncovered"))
+        ),
+        "tasks_by_source": tasks_by_source,
+        "findings_by_status": findings_by_status,
+    }
+    for key in ("source_files", "covered_files", "catchall_tasks", "catchall_dropped"):
+        if isinstance(coverage_file.get(key), int):
+            coverage[key] = coverage_file[key]
+
+    caveats: list[str] = []
+
+    # A task's status comes from `tasks.json` when the queue itself recorded
+    # one, and otherwise from the `task_outcomes.json` ledger that the hunter
+    # appends to as it works. Without the second source nothing ever wrote a
+    # status down, so `statuses_known` was false on every run ever made and the
+    # caveat below fired unconditionally — which meant a thorough hunt and an
+    # abandoned one produced the same report.
+    outcomes = run.get("task_outcomes") or {}
+
+    def _status(task: dict) -> str:
+        recorded = task.get("status")
+        if recorded:
+            return str(recorded)
+        entries = outcomes.get(str(task.get("task_id") or ""))
+        if not entries:
+            return ""
+        last = entries[-1].get("outcome")
+        return {"findings": "done", "clean": "done",
+                "skipped": "skipped", "error": "failed"}.get(str(last), "")
+
+    statuses = [_status(t) for t in tasks]
+    statuses_known = bool(tasks) and all(s for s in statuses)
+    if statuses_known:
+        failed = sum(1 for s in statuses if s == "failed")
+        incomplete = sum(1 for s in statuses if s not in ("done", "failed"))
+        coverage["tasks_failed"] = failed
+        coverage["tasks_incomplete"] = incomplete
+        if failed or incomplete:
+            caveats.append(
+                f"{failed} hunt task(s) FAILED and {incomplete} never completed — "
+                "the attack angles they covered were not examined. Absence of a "
+                "finding in those areas is not evidence that none exists."
+            )
+    elif tasks:
+        coverage["tasks_status_known"] = False
+        caveats.append(
+            f"{len(tasks)} hunt task(s) were queued but tasks.json records no "
+            "per-task outcome, so it is not known whether every one completed. "
+            "Coverage cannot be asserted complete on unmeasured tasks."
+        )
+
+    unreconciled = [
+        i for i in inputs if not i.get("disposition")
+    ] if inputs else []
+    if unreconciled:
+        caveats.append(
+            f"{len(unreconciled)} enumerated input(s) never reached a disposition "
+            "— they were neither hunted nor explicitly ruled out."
+        )
+
+    if withheld:
+        reasons: dict[str, int] = {}
+        for finding in withheld:
+            reason = finding.get("_withheld_reason") or "unknown"
+            reasons[reason] = reasons.get(reason, 0) + 1
+        coverage["findings_withheld"] = reasons
+
+    coverage["execution"] = execution_summary(findings, run.get("manifest") or {})
+
+    coverage["coverage_complete"] = bool(
+        coverage.get("catchall_dropped", 0) == 0
+        and not unreconciled
+        and statuses_known
+        and coverage.get("tasks_failed", 0) == 0
+        and coverage.get("tasks_incomplete", 0) == 0
+    )
+    if caveats:
+        coverage["caveats"] = caveats
+    payload["coverage"] = coverage
+
+
+def attach_preflight(payload: dict, preflight: dict) -> None:
+    """Record what the run could ACTUALLY do, and caveat it where it could not.
+
+    A scan whose container lacks the target's dependencies still emits findings
+    — they are just static guesses that read like executed proof. The caveat is
+    the part that matters: it puts the limitation where someone reading the
+    findings will actually meet it, instead of in a log nobody opens.
+    """
+    if not preflight:
+        return
+    coverage = payload.setdefault("coverage", {})
+    coverage["preflight"] = preflight
+    if preflight.get("execution_enabled") and not preflight.get(
+        "poc_confirmation_available"
+    ):
+        missing = ", ".join(preflight.get("degraded") or []) or "unknown"
+        coverage.setdefault("caveats", []).append(
+            "Executed-PoC confirmation was requested but NOT fully available in "
+            f"this container (missing: {missing}). Findings below may not have "
+            "been proven by execution, and a finding that could not be proven "
+            "here must NOT be read as disproven."
+        )
+        coverage["coverage_complete"] = False
+
+
+def subsystem_for(subsystems: list[dict], path: str | None) -> str:
+    """Which recon subsystem owns a file.
+
+    The rule is the one ``stages/_common.py`` and ``stages/gapfill.py`` both
+    used, kept in one place this time: a subsystem matches when its ``name`` is
+    the path exactly, or when the path sits under its ``path`` prefix. Anything
+    unmatched is ``"unknown"`` — an honest label, and never silently folded
+    into a neighbouring subsystem.
+    """
+    if not path:
+        return "unknown"
+    for subsystem in subsystems or []:
+        prefix = str(subsystem.get("path") or "")
+        if subsystem.get("name") == path or (prefix and path.startswith(prefix)):
+            return str(subsystem.get("name") or "unknown")
+    return "unknown"
+
+
+def attach_subsystem_breakdown(payload: dict, findings: list[dict], run: dict) -> None:
+    """Where the findings clustered, by recon subsystem.
+
+    A count per subsystem answers the question an operator actually asks of a
+    scan result — "which part of my system is the problem?" — and it is a
+    read of data already on disk, so it costs nothing and cannot be wrong in a
+    way the finding list is not. Omitted entirely when recon recorded no
+    subsystems: an inventory of one bucket called "unknown" is noise.
+    """
+    subsystems = (
+        (run.get("inputs") or {}).get("subsystems")
+        or (run.get("recon") or {}).get("subsystems")
+        or []
+    )
+    if not subsystems:
+        return
+    breakdown: dict[str, int] = {}
+    for finding in findings:
+        name = subsystem_for(subsystems, finding.get("file"))
+        breakdown[name] = breakdown.get(name, 0) + 1
+    payload.setdefault("coverage", {})["findings_by_subsystem"] = dict(
+        sorted(breakdown.items())
+    )
+
+
+def attach_gaps(payload: dict, gaps: dict) -> None:
+    """Carry the hunters' self-reported coverage gaps into the report.
+
+    ``gaps_observed`` is not optional politeness: an empty array asserts the
+    hunter examined everything in scope. A gap that a hunter reported and the
+    report omitted is a disclosed limitation turned back into implied coverage.
+    """
+    entries = gaps.get("gaps") or []
+    if entries:
+        payload.setdefault("coverage", {})["gaps_observed"] = entries
+
+
+# --------------------------------------------------------------------------
+# The narrative merge — the one place model prose enters the payload
+# --------------------------------------------------------------------------
+
+def merge_narrative(payload: dict, narrative: dict) -> dict:
+    """Join phase 4's prose to the computed payload. Prose only, by whitelist.
+
+    This is the half of the phase-4 contract that was missing (5c). The phase
+    tells the model to write ``logs/report_narrative.json`` and then to run
+    ``report_build.py build --narrative …``; the flag did not exist, so the
+    command failed outright at the end of a long, expensive run. Worse, had it
+    merely been dropped from the phase, the prose would have had nowhere to go:
+    ``impact``, ``exploit_scenario``, ``how_to_fix``, ``preconditions`` and
+    ``threat_model`` are all in ``report.schema.json``, all rendered by
+    ``reporting/markdown.py``, and NOTHING computed them — so every advisory
+    printed "_Not determined (static run)._" for all of them, and every finding
+    carried the same boilerplate ``DEFAULT_RECOMMENDATION``. The flag is the
+    right side of the disagreement, so it is implemented here.
+
+    Two rules make this safe:
+
+    * **Whitelist, never blacklist.** Only ``NARRATIVE_FINDING_FIELDS`` and
+      ``NARRATIVE_TOP_LEVEL_FIELDS`` are copied. A blacklist would silently
+      admit every field a later schema revision adds, which is exactly how a
+      model-authored number reaches a report that promises none.
+    * **Key presence, not truthiness.** An explicitly empty ``preconditions``
+      array is a CLAIM ("there are no preconditions") and the phase says to
+      mean it, so it must survive the merge. Truthiness would discard it and
+      the finding would render "_Not determined_" instead — a claim quietly
+      converted into a gap.
+
+    Findings join on ``finding_id``. A narrative entry naming a finding that
+    was not delivered is not an error (the verifier may have rejected it after
+    the model wrote its prose) but it IS reported, because the alternative is
+    prose vanishing with no trace.
+
+    Returns a report of what happened, for the CLI to print and for ``--strict``
+    to fail on. Nothing here mutates a computed field, so a violation cannot
+    corrupt the payload — but it is still surfaced, because supplying one means
+    the model believed it was computing something it was not.
+    """
+    applied_fields = 0
+    findings_with_prose = 0
+    unmatched: list[str] = []
+    computed_supplied: set[str] = set()
+
+    for field in COMPUTED_TOP_LEVEL_FIELDS:
+        if field in narrative:
+            computed_supplied.add(field)
+    for field in NARRATIVE_TOP_LEVEL_FIELDS:
+        if field in narrative:
+            payload[field] = narrative[field]
+            applied_fields += 1
+
+    entries_by_id = {
+        str(e["finding_id"]): e
+        for e in payload.get("findings", [])
+        if e.get("finding_id")
+    }
+    for index, item in enumerate(narrative.get("findings") or []):
+        if not isinstance(item, dict):
+            unmatched.append(f"<narrative findings[{index}]: not an object>")
+            continue
+        # Checked BEFORE the unmatched short-circuit: supplying a computed
+        # field is a statement about what the model thought it was doing, and
+        # that belief is just as wrong on a finding that happened not to be
+        # delivered. Skipping the check there would make the violation report
+        # depend on delivery, which is unrelated.
+        for field in COMPUTED_FINDING_FIELDS + COMPUTED_TOP_LEVEL_FIELDS:
+            if field in item:
+                computed_supplied.add(f"findings[].{field}")
+
+        finding_id = str(item.get("finding_id") or "")
+        entry = entries_by_id.get(finding_id)
+        if entry is None:
+            unmatched.append(finding_id or f"<narrative findings[{index}]: no finding_id>")
+            continue
+        touched = False
+        for field in NARRATIVE_FINDING_FIELDS:
+            if field in item:
+                entry[field] = item[field]
+                applied_fields += 1
+                touched = True
+        if touched:
+            findings_with_prose += 1
+
+    return {
+        "narrative_findings_with_prose": findings_with_prose,
+        "narrative_fields_applied": applied_fields,
+        "narrative_unmatched_finding_ids": unmatched,
+        "narrative_computed_fields_supplied": sorted(computed_supplied),
+    }
+
+
+# --------------------------------------------------------------------------
+# Build
+# --------------------------------------------------------------------------
+
+def build(
+    results_dir: str | Path,
+    *,
+    redact: bool = True,
+    narrative: dict | None = None,
+    merge_report: dict | None = None,
+) -> dict:
+    """Assemble the complete report payload for a results directory.
+
+    ``narrative`` is phase 4's prose document, merged BEFORE redaction so the
+    model's sentences pass through ``redact_json`` like everything else. A
+    merge done after redaction would route model prose around the one masking
+    boundary the design relies on — and prose is where a quoted secret is most
+    likely to appear, since the model has read the source. ``merge_report``, if
+    given, is updated in place with what the merge did.
+    """
+    run = load_run(results_dir)
+    findings = run["findings"]
+    verifications = run["verifications"]
+    findings_by_id = {f["finding_id"]: f for f in findings}
+    tasks_by_id = {
+        str(t.get("task_id")): t for t in ((run.get("tasks") or {}).get("tasks") or [])
+    }
+
+    delivered, withheld = select_delivered(findings, verifications)
+    payload = build_report_payload(run, delivered, tasks_by_id)
+
+    attach_cwe(payload, findings_by_id)
+    attach_poc_evidence(payload, findings_by_id, run["proofs"])
+    attach_variants(payload, findings)
+    attach_validation(payload, findings_by_id, verifications)
+    attach_cvss(payload, verifications, run["inputs"])
+    attach_input_inventory(payload, run["inputs"], run["coverage"])
+    attach_coverage(payload, run, withheld)
+    attach_subsystem_breakdown(payload, findings, run)
+    attach_preflight(payload, run["preflight"])
+    attach_gaps(payload, run["gaps"])
+    attach_scan_metrics(payload, run["coverage"], run["manifest"])
+    attach_verification(payload, findings, verifications)
+
+    if narrative is not None:
+        report = merge_narrative(payload, narrative)
+        if merge_report is not None:
+            merge_report.update(report)
+
+    return redact_json(payload) if redact else payload
+
+
+def report_stats(payload: dict) -> dict:
+    """The handful of numbers phase 4's prose must quote, pulled out so the
+    renderer does not have to re-derive (and so re-derive differently) any of
+    them."""
+    execution = (payload.get("coverage") or {}).get("execution") or {}
+    stats = {
+        "delivered": payload.get("summary", {}).get("total", 0),
+        "by_severity": payload.get("summary", {}).get("by_severity", {}),
+        "total_findings": execution.get("total", 0),
+        "provable_by_execution": execution.get("provable_by_execution", 0),
+        "proven_by_execution": execution.get("proven_by_execution", 0),
+        "not_applicable": execution.get("not_applicable", 0),
+        "not_provable_by_observer": execution.get("not_provable_by_observer", 0),
+        "isolation_tier": execution.get("isolation_tier"),
+        "mode": execution.get("mode"),
+        "coverage_complete": (payload.get("coverage") or {}).get("coverage_complete"),
+        "caveats": (payload.get("coverage") or {}).get("caveats", []),
+    }
+    # The plain-language sentence rides with the number it explains. A bare
+    # "not_provable_by_observer: 4" invites the reader to hear "4 findings we
+    # tried and failed to prove", which is the opposite of what it means.
+    if execution.get("not_provable_by_observer_note"):
+        stats["not_provable_by_observer_note"] = execution[
+            "not_provable_by_observer_note"
+        ]
+        stats["not_provable_by_observer_classes"] = execution.get(
+            "not_provable_by_observer_classes", {}
+        )
+    return stats
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def _load_narrative(path_str: str) -> dict:
+    """Read phase 4's narrative document, refusing anything else.
+
+    A missing or malformed narrative is a hard error, never a silent skip: the
+    caller asked for prose to be merged, and a report that quietly omits the
+    model's entire narrative while exiting 0 is precisely the "silence reads as
+    coverage" failure this module was built to stop.
+    """
+    path = Path(path_str)
+    try:
+        loaded = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise ValueError(f"--narrative {path}: no such file") from None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"--narrative {path}: unreadable JSON ({exc})") from None
+    if not isinstance(loaded, dict):
+        raise ValueError(f"--narrative {path}: expected a JSON object")
+    return loaded
+
+
+def _cmd_build(args: argparse.Namespace) -> int:
+    narrative = _load_narrative(args.narrative) if args.narrative else None
+    merge_report: dict[str, Any] = {}
+    payload = build(
+        args.results_dir,
+        redact=not args.no_redact,
+        narrative=narrative,
+        merge_report=merge_report,
+    )
+    errors = validate_schema(payload, Path(_bootstrap.schema_path("report")))
+
+    out_path = Path(args.out or Path(args.results_dir) / "report.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2) + "\n")
+
+    markdown_path = None
+    if args.markdown:
+        # A deterministic Markdown rendering. Phase 4 passes --markdown
+        # explicitly so that report.md is produced by this code path and never
+        # hand-written; it stays opt-in rather than defaulting to
+        # <results-dir>/report.md so that no other caller has a file clobbered
+        # out from under it by a flag it did not pass.
+        from reporting.markdown import render_report
+
+        markdown_path = Path(args.markdown)
+        markdown_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown_path.write_text(render_report(payload))
+
+    result = {
+        "report_path": str(out_path),
+        "markdown_path": str(markdown_path) if markdown_path else None,
+        "schema_errors": errors,
+        **merge_report,
+        **report_stats(payload),
+    }
+    for error in errors:
+        print(f"report.json does not match report.schema.json: {error}", file=sys.stderr)
+
+    # A narrative that carried a computed field is a contract violation, not a
+    # cosmetic one: it means the model believed it was computing a number this
+    # report guarantees it never computes. The value was discarded by the
+    # whitelist, so the payload is sound — but the belief needs correcting, and
+    # `--strict` is where the phase says that surfaces.
+    violations = merge_report.get("narrative_computed_fields_supplied") or []
+    for field in violations:
+        print(
+            f"narrative supplied a computed field and it was discarded: {field}",
+            file=sys.stderr,
+        )
+    for finding_id in merge_report.get("narrative_unmatched_finding_ids") or []:
+        print(
+            f"narrative prose for {finding_id} was dropped: not a delivered finding",
+            file=sys.stderr,
+        )
+
+    print(json.dumps(result, indent=2))
+    if args.strict and (errors or violations):
+        return 2
+    return 0
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    print(json.dumps(report_stats(build(args.results_dir)), indent=2))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="report_build.py",
+        description="Assemble report.json from a PyHunt results directory. "
+                    "Every number in the advisory comes from here.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    build_cmd = sub.add_parser("build", help="write report.json")
+    build_cmd.add_argument("--results-dir", required=True)
+    build_cmd.add_argument("--out", help="default: <results-dir>/report.json")
+    build_cmd.add_argument("--markdown", help="also render a deterministic "
+                                              "Markdown advisory to this path")
+    build_cmd.add_argument("--narrative",
+                           help="phase 4's prose document "
+                                "(logs/report_narrative.json). Only the "
+                                "narrative fields are merged; computed fields "
+                                "it carries are discarded and reported")
+    build_cmd.add_argument("--strict", action="store_true",
+                           help="exit 2 on a contract violation — the report "
+                                "does not match report.schema.json, or the "
+                                "narrative supplied a computed field (the "
+                                "report is still written either way)")
+    build_cmd.add_argument("--no-redact", action="store_true",
+                           help="skip secret redaction — for local debugging only")
+    build_cmd.set_defaults(func=_cmd_build)
+
+    stats = sub.add_parser(
+        "stats",
+        help="the numbers phase 4's prose must quote, without writing anything",
+    )
+    stats.add_argument("--results-dir", required=True)
+    stats.set_defaults(func=_cmd_stats)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return int(args.func(args))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
