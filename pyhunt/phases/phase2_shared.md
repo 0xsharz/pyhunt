@@ -292,18 +292,51 @@ over-claim check — so it must be honest and complete either way.
    we detect that this phase has drifted into optimism. An honest `false` costs
    you nothing.
 
-### 6.3 Execution availability
+### 6.3 Execution availability — and where execution happens
 
-`execution_available` tells you whether PoCs actually run on this host.
+**You do not run target code. Ever. Not on the host.**
 
-- **`false` (Static mode)** — reason statically, build the source→sink argument,
-  and set `needs_poc: true`. **Omit the `poc` object entirely**: the schema
-  requires a real `run_output` inside it, and there is no honest value for that
-  field when nothing ran. Say in the description what a later sandboxed run
-  should try.
-- **`true` (Proof mode)** — you **must** attempt a PoC, and `poc_execution` is
-  the concrete recipe for this repo's Python runtime. Use it rather than
-  improvising.
+This section used to say `execution_available` "tells you whether PoCs actually
+run **on this host**", and hunt agents reasonably read that as permission. In a
+real run they built Python virtualenvs under `scratch_dir`, `pip install -e`'d
+the target, and executed the target plus attacker payloads on the operator's
+laptop — outside the sandbox phase 0 had just spent a page verifying. They were
+following this file, which is the correct thing for a hunt agent to do; the file
+was wrong, and `SKILL.md` §5 and §10 said the opposite ("target code executes
+**only inside the container**", "running a PoC outside a verified sandbox
+because it looks harmless" listed among the things that will tempt you and are
+wrong).
+
+The document that is right is `SKILL.md`. You are about to execute an exploit
+against code you have just concluded is exploitable, and the authoring step is
+the one that runs the most novel code in the whole run.
+
+So:
+
+- **`execution_available: false` (Static mode)** — reason statically, build the
+  source→sink argument, and set `needs_poc: true`. **Omit the `poc` object
+  entirely**: the schema requires a real `run_output` inside it, and there is no
+  honest value for that field when nothing ran. Say in the description what a
+  later sandboxed run should try.
+- **`execution_available: true` (Proof mode)** — you **must** write a PoC, and
+  `poc_execution` is the concrete recipe for this repo's Python runtime. Write
+  it to be correct by construction and hand it over. **Phase 2b runs it**, in a
+  fresh container, three times, under an observer you never touch, and the gate
+  judges that — not anything you ran.
+
+What this costs you is the ability to iterate against a live interpreter, and
+that is a real cost. Two things pay it back:
+
+- The gate has never read your transcript anyway. `poc.run_output` is not the
+  gate's input and never was (`SKILL.md` §3): replay captures its own. A PoC you
+  ran successfully on the host and a PoC you reasoned about carefully reach the
+  gate as exactly the same artifact.
+- `poc.notes` is where you say what you could not check. "I could not verify
+  that `Meta.schema_name` accepts a newline without running it" is useful to
+  phase 2c and costs nothing. A guess presented as a result is what costs.
+
+If you believe a PoC needs a trial run to be worth writing, say so in
+`poc.notes` and write your best version. Do not run it.
 
 ### 6.4 Writing the PoC
 
@@ -329,26 +362,47 @@ function. A PoC that calls `os.system` (or `pickle.loads`, or `cursor.execute`)
 to your file and return `self_attributed`. If that happens, rewrite the PoC to
 enter through the target and run it again; do not report it as evidence.
 
-**Put the nonce in the payload.** `poc_execution.nonce` is a token minted for
-this run, and `poc_execution.canary_path` is a path built from it. Your payload
-should cause **the target** to touch that path — `; touch <canary_path>`,
+**Put the nonce in the payload, as a LITERAL, at authoring time.**
+`poc_execution.nonce` is a token minted for this run and
+`poc_execution.canary_path` is a path built from it. Your payload should cause
+**the target** to touch that path — `; touch <canary_path>`,
 `id > <canary_path>`, `open('<canary_path>','w')` — whichever fits your sink.
-Your class file gives the shape for your sinks. The nonce travels two
-independent ways: the observer stamps it onto every line it prints, and your
-payload carries it in the event's own arguments. A payload carrying the nonce is
-the one that survives a lost stamp, and a materialised canary is the strongest
-evidence available — it cannot be explained by the sink merely running.
+Your class file gives the shape for your sinks.
 
-**Run it under the observer.** If `poc_execution.observer` is non-null:
+> **`os.environ.get("PYHUNT_NONCE")` is always `None` inside a PoC.** The audit
+> hook pops `PYHUNT_NONCE` and `PYHUNT_OBSERVER_KEY` out of `os.environ` at
+> import, before any PoC or target code runs. That deletion is deliberate: it is
+> the measure that stops a hostile repository reading the nonce and printing a
+> forged marker line. So a PoC written as
+> `NONCE = os.environ.get("PYHUNT_NONCE") or "<literal>"` **silently uses the
+> literal, every time**, and if that literal is stale the run comes back
+> `sink_reached_unproven` — which is indistinguishable, in the report, from a
+> working defence.
+>
+> This is not hypothetical. A real code execution was lost to it: three
+> container transcripts showed the target's own frame compiling and running
+> attacker-controlled Python as `uid=0(root)`, conditions 1, 2, 4 and 5 all
+> satisfiable, and the verdict was `sink_reached_unproven` because condition 3
+> had nothing to match. Copy the value out of `poc_execution.nonce` into your
+> payload text. Do not read it at run time.
 
-1. run its `available_check` **first**;
-2. if the check passes, substitute your run command into the `{cmd}` placeholder
-   in `observer.wrap` and run that;
-3. search the combined output for `observer.evidence_markers`.
+The nonce travels two independent ways: the observer stamps it onto every line
+it prints, and your payload carries it in the event's own arguments. A payload
+carrying the nonce is the one that survives a lost stamp, and a materialised
+canary is the strongest evidence available — it cannot be explained by the sink
+merely running.
 
-`observer.files` are helper files already written into your `scratch_dir`.
-`observer.notes` lists that mechanism's blind spots — read them before you claim
-proof.
+**Write the PoC to run under the observer; do not run it yourself.**
+`poc_execution.observer` describes the instrumentation phase 2b will arm around
+your script: `available_check`, the `{cmd}` template in `observer.wrap`, and
+`evidence_markers` — the substrings whose presence in the transcript means the
+dangerous operation fired. Phase 2b performs the substitution and the run. Read
+`observer.notes` for that mechanism's blind spots before you decide what your
+PoC should assert — a PoC aimed at a sink the observer cannot see is a PoC that
+will come back `no_event` however good it is.
+
+`observer.files` are the helper assets; the harness materialises its own copies
+inside the container, from the skill, so nothing you place beside them travels.
 
 **Know what the observer can and cannot see.** It is a PEP-578 audit hook, so it
 records exactly these CPython events and nothing else:
@@ -481,6 +535,222 @@ to settle. Later phases read code you have not read, and they get their turn.
 
 ---
 
+### 6.8 The second oracle — declare a `structural_probe`
+
+There is a whole population of real defects the audit hook cannot see, and until
+recently the only honest thing PyHunt could say about them was `not_applicable`.
+On one real run that was **74 of 145 findings** — every one accurate, every one
+useless to a reader, because "no execution could settle this" says nothing about
+whether the defect is real.
+
+It is now settleable, deterministically, by a second oracle. Run:
+
+```bash
+python3 <skill>/scripts/structural.py kinds
+```
+
+for the vocabulary. Nine probe kinds:
+
+| kind | settles | the differential it measures |
+|---|---|---|
+| `codegen_ast` | codegen / template injection into generated source | benign vs hostile render, then **where the parser puts the attacker's text**: an executable node, or an inert string constant |
+| `growth_curve` | resource exhaustion, algorithmic complexity, unbounded allocation | cost at an ascending size ladder under `RLIMIT_AS`/`RLIMIT_CPU` in a forked child, against a benign rung that must complete |
+| `state_mutation` | global-state contamination, shared registries, process-wide config | a named module global before and after a hostile call, against a benign control that must leave it unchanged |
+| `exception_escape` | unhandled crashes reachable from attacker bytes | what escapes a public entry point on hostile input, against a benign call that must succeed |
+| `differential_response` | **access control, IDOR, auth bypass, privilege escalation, information disclosure** | the same call made as two principals: does the unprivileged one receive a value only the privileged one should see? |
+| `type_selection` | **unsafe reflection, type confusion, union collisions, mass assignment** | change only the attacker-controlled field: does a **different class** get constructed? |
+| `config_assertion` | **supply chain, CI and IaC misconfiguration** | parse the committed workflow/config and evaluate one assertion from a closed vocabulary against a dotted path. No target code runs at all. |
+| `sink_semantics` | **SQL/NoSQL injection, command injection, path traversal, zip-slip, SSRF, open redirect, XSS, SSTI** | the dangerous callable is **wrapped so it captures and never runs**, then what actually arrived is analysed: did the payload become syntax, or is it still data? |
+| `flow_witness` | **SQL injection, XSS, open redirect, SSTI, log/header injection** — every class CPython raises no audit event for | whether a sentinel-bearing value is **live in the claimed sink's frame at the claimed line**, traced with `sys.settrace` scoped to the target's own frames |
+
+#### Access control is measurable. Business logic is not.
+
+Three classes were previously filed as "policy questions no measurement
+answers". That was true of one of them and wrong about the rest, and the
+distinction is worth holding onto:
+
+- **Authorisation has an observable definition** — two principals, one call,
+  different answers. `differential_response` plants a sentinel only the
+  privileged context should see and asks whether the unprivileged one gets it.
+  Two reads, nothing written, nothing exploited.
+- **Dispatch steering is a type comparison.** `type_selection` changes only the
+  attacker-controlled field and asks whether a different class comes back. This
+  is the union name-collision shape.
+- **A workflow file is data.** Whether the job holding a publishing credential
+  has an `environment:` gate is a key lookup. `config_assertion` parses the
+  committed bytes and evaluates one assertion — `key_absent`, `key_present`,
+  `value_equals`, `value_matches`, `value_not_matches`.
+
+**What stays judgment-only: business logic.** `business_logic`, `logic_error`
+and `logic_chain` get no probe and never will. A probe claiming to settle "this
+refund flow can be replayed" would be inventing a measurement, and that is the
+category error the `not_applicable` bucket exists to prevent. Report those on
+their static argument and say so.
+
+One trap worth knowing about `config_assertion`: **YAML turns bare `on` into the
+boolean `True`.** Every GitHub workflow starts with `on:`, so the trigger block
+parses under a key of `True`. The harness resolves `on`, `off`, `yes` and `no`
+to their boolean forms; without that, `on.push.tags` would report "key absent"
+on every workflow ever written.
+
+#### `sink_semantics` — the non-intrusive PoC, done properly
+
+This is the probe to reach for whenever a dangerous callable can be named. It
+makes **both** of the claims a reader needs, and `flow_witness` only makes the
+first:
+
+1. the payload **reaches** the dangerous construct, and
+2. it arrives as **syntax**, not as data.
+
+The harness wraps the callable you name in `intercept` with a shim that captures
+its arguments and raises immediately. **The operation is never performed** — no
+query executes, no file opens, no request leaves the container. Then it calls
+your entry point twice, benign and hostile, and analyses what arrived.
+
+```json
+"structural_probe": {
+  "kind": "sink_semantics",
+  "target": "pkg.api.lookup",
+  "intercept": "pkg.db.run_query",
+  "argument": 0,
+  "semantics": "sql",
+  "benign_args": ["$PYHUNT_BENIGN"],
+  "hostile_args": ["x' OR '$PYHUNT_NONCE'='"],
+  "rationale": "the name parameter reaches the query builder unescaped"
+}
+```
+
+On a real vulnerable/parameterised pair this produces:
+
+| | what arrived at the sink | verdict |
+|---|---|---|
+| concatenated | `SELECT * FROM t WHERE n = 'x' OR '<nonce>'=''` | **demonstrated** — the span broke out of the literal |
+| parameterised | `SELECT * FROM t WHERE n = ?` | **refuted** — the payload never entered the SQL text |
+
+Six analysers, and the vocabulary is closed: `sql`, `path`, `url`, `shell`,
+`html`, `format`. Each asks one question — did the attacker's text acquire
+grammatical force in *that* grammar?
+
+Three things to get right:
+
+- **`intercept` is the Python-level callable your target actually calls**, not
+  the driver method underneath it. `sqlite3.Cursor.execute` lives on an
+  immutable C type and cannot be wrapped at all; the harness says so and names
+  the alternative. The wrapper is usually the more meaningful boundary anyway.
+- **Put the whole attack in `hostile_args`, not just the sentinel.** The
+  analyser examines the span *you* injected. `"x' OR '$PYHUNT_NONCE'='"` is
+  analysable; `"$PYHUNT_NONCE"` alone tells it nothing about quoting.
+- **The benign control must be benign.** The differential is what makes this
+  evidence: a builder that renders every value as structure is broken in a way
+  that says nothing about this attacker.
+
+#### `flow_witness` is the one that answers a question the others assume
+
+The other four ask whether a dangerous property holds. This one asks the prior
+question: **does the attacker's data actually arrive?** It needs no dangerous
+operation to fire, which is why it reaches the classes the audit hook is blind
+to — a fully successful SQL injection raises no audit event, so the execution
+gate could never settle it however sound the finding is.
+
+Its negative result is worth as much as its positive one. *"Not witnessed, last
+seen at `validators.py:88`"* is a precise, checkable statement that a sanitiser
+exists and works, **on the line it works**. That is what phase 2c currently has
+to establish by reading.
+
+Declare three things:
+
+```json
+"structural_probe": {
+  "kind": "flow_witness",
+  "target": "pkg.api.handle_search",
+  "entry_args": ["name=evil-$PYHUNT_NONCE-'"],
+  "sink_location": "pkg/db/query.py:41",
+  "rationale": "the `name` parameter reaches raw string concatenation into SQL"
+}
+```
+
+- `target` — the **public entry point**, not the sink. The point is to trace the
+  path an attacker actually has.
+- `entry_args` / `entry_kwargs` — must contain `$PYHUNT_NONCE` somewhere. The
+  sentinel is the entire mechanism; without it the tracer cannot tell the
+  attacker's value from any other string the target is holding. A spec without
+  it is refused with exit 2.
+- `sink_location` — `file:line`, exact. The verdict is the claim that the
+  sentinel is live in **that** frame at **that** line, so an approximate line
+  makes the result meaningless.
+
+**Arrival is graded, and you should understand why before reading a verdict.**
+The probe distinguishes a value that arrived *byte-for-byte as supplied* from
+one that arrived *transformed*. Only the first is `demonstrated`. This is not
+pedantry: a sanitiser that strips quotes leaves a hex nonce untouched, so a
+properly defended path still reports "the sentinel arrived". It arrived
+harmless. `refuted` in that case names the last frame that held the value
+unaltered — which is where the transform lives.
+
+Two limits, stated so you do not discover them as surprises:
+
+- `sys.settrace` costs 10–50× in wall time. The probe is bounded by the same
+  container timeout as everything else and reports `event_cap_reached` rather
+  than truncating silently.
+- The trace does not follow values through C extensions. A value that transits a
+  C decoder is seen entering and leaving but not inside; that is reported as a
+  bounded trace, never as a negative result.
+
+
+**You declare data. You do not write the assertion.** That is the whole design.
+A PoC that parses its own output and asserts "the marker became a syntax node"
+is the party with an interest in the answer grading its own work — the exact
+failure the execution gate exists to remove. So the probe is a JSON object on
+the finding: a dotted callable, a benign input, a hostile input. PyHunt's own
+harness runs it inside the container, computes the property, signs the result,
+and `oracle/structural.py` decides. There is nowhere in the spec to put code,
+and a spec carrying an unknown key is refused with exit 2 rather than ignored.
+
+```json
+"structural_probe": {
+  "kind": "codegen_ast",
+  "target": "pkg.model_generator.generator.ModelGenerator.render",
+  "construct": "pkg.model_generator.generator.ModelGenerator",
+  "benign_args": [{"type": "record", "name": "M",
+                   "doc": "an ordinary docstring $PYHUNT_BENIGN"}],
+  "hostile_args": [{"type": "record", "name": "M",
+                    "doc": "x\"\"\"\n    pyhunt_$PYHUNT_NONCE()\n    \"\"\""}],
+  "rationale": "the doc field is interpolated into a triple-quoted docstring with no escaping"
+}
+```
+
+Four rules that decide whether your probe is worth anything:
+
+1. **`$PYHUNT_NONCE` goes in the hostile input; `$PYHUNT_BENIGN` goes in the
+   benign one.** The harness substitutes both. The benign marker is minted by
+   the harness, not by you, so a control cannot be chosen to collide with the
+   payload. For `codegen_ast` the nonce in the payload is **mandatory** — the
+   claim is that *this* string became code.
+2. **Prefer the nonce as an identifier** (`pyhunt_<nonce>()`) over the nonce
+   inside a string argument. Both work — the harness reads the enclosing
+   statement as well as the innermost node — but an identifier makes the answer
+   unambiguous in one field.
+3. **`target` must resolve inside the target.** The harness reports
+   `inspect.getfile()` of the callable it actually called, and a path outside
+   the target roots fails condition S-2 and the whole probe is discarded. This
+   is condition 4's analogue and it fails closed.
+4. **The benign control must work.** If the control render does not parse, or
+   the control call raises, or the benign marker never reaches the output, the
+   probe is a `probe_error` and says nothing. One-sided evidence is not
+   evidence: a generator that emits a call node for every input is doing its job.
+
+A probe can come back **`refuted`** — the differential ran and the defence held.
+That is a real result and it is *supposed* to be possible. It never deletes your
+finding, and phase 2c will read it; a verifier confirming past a `refuted` probe
+has to say why in writing. If your probe is refuted and you still believe the
+finding, the useful thing is to say in `poc.notes` what the probe could not see.
+
+Declare a probe whenever your finding's class is in the table above. A finding
+in one of those classes with no probe is a finding that will be reported on its
+static argument alone, and the report now says so by name.
+
+---
+
 ## 7. Output
 
 Write **one JSON object** to `<results_dir>/logs/hunt/<unit_id>.json` and
@@ -516,11 +786,28 @@ nothing else there. It must validate against `schemas/finding.schema.json`:
     {"file_or_subsystem": "app/legacy/",
      "reason": "exceeded read budget; 4200 lines unread",
      "suggested_attack_class": "path_traversal"}
-  ]
+  ],
+  "files_read": ["app/routes.py", "app/db.py", "app/validators.py"]
 }
 ```
 
 Rules the schema does not state:
+
+- **`files_read` is required, and it means what it says.** Every repo-relative
+  path you actually opened, including files you opened and found irrelevant.
+  Phase 3 joins it against your task's `target_files` and reports the
+  difference.
+
+  The coverage ledger is *input*-level: it proves every enumerated input reached
+  a disposition. It cannot see that a unit assigned five files answered from
+  two. That unit's task has an outcome, its inputs have dispositions, and the
+  coverage number reads full — the gap has no name and produces no warning.
+  This field is the only thing that gives it one.
+
+  **Report short and honest rather than complete and false.** An unread file is
+  a gap the sweep re-queues; an inflated list is a coverage claim nothing
+  downstream can check. Not reading a file is a normal outcome and is never
+  held against you. Claiming you did is the one thing that breaks the ledger.
 
 - **`task_id`** is the task this object reports on. If your chunk held several
   tasks, emit one object per task — as a JSON array of these objects in the same
@@ -549,6 +836,24 @@ message; a long return message only burns its context.
 - **Emit findings only for your class group.** Anything else you notice goes
   into `gaps_observed` with a `suggested_attack_class`. It is not lost — the
   sweep re-queues it.
+
+- **If you CLEAR a surface, record it as a dismissal — with the question you
+  asked.** This is the recall rule, and it exists because of a specific,
+  expensive miss. A sweep once cleared every `.fake()` method in a library with
+  the reasoning: *"`random.choice` / `random.randint` / `uuid.uuid1` all appear
+  exclusively inside `.fake()` methods, whose entire job is synthetic test
+  data."* That is correct for the question it was asking — weak randomness — and
+  wrong for the one it was not: a schema-supplied `size` and `max_digits` field
+  driving an unbounded allocation. Two real findings were lost, and nothing in
+  the run recorded that the surface had been looked at *under one lens only*.
+
+  So when you decide a whole file, directory, or family of methods is not
+  interesting, that is not silence — it is a `gaps_observed` entry whose
+  `reason` names **the lens you applied**, in the form "cleared for <class>:
+  <why>". Phase 3 re-queues a cleared surface under every *other* lens that
+  would touch it. "Cleared under lens X" is not the same as "covered", and the
+  ledger now knows the difference.
+
 - **Zero findings is a valid, respectable output** when the code is clean. Do
   not pad the queue with low-confidence noise, and never invent a `high`.
 - **Do not refactor anything, do not comment on style, do not fix what you

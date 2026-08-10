@@ -5,16 +5,30 @@
     python3 "${SKILL_DIR}/scripts/tasks.py" generate \\
         --repo "${TARGET}" --results-dir "${RESULTS_DIR}"
 
-It composes five task sources into `tasks.json`. One task is one
+It composes six task sources into `tasks.json`. One task is one
 (entry point, sink, path) plus exactly the source needed to judge it — never
-"here is the repo, find bugs". The five sources, **in this order**:
+"here is the repo, find bugs". The six sources, **in this order**:
 
 1. `taint`         — forward (input → sink) call-graph paths      (`taint.py`)
 2. `sink_backward` — orphan sinks, hunted backward through callers (`taint.py`)
-3. `specialist`    — gated repo-wide lens sweeps            (`specialists.py`)
-4. `history`       — sibling sites of a previously-patched idiom  (`history.py`
+3. `entry_forward` — every enumerated entry point followed forward, queued
+                     whether or not a sink was found behind it          (here)
+4. `specialist`    — gated repo-wide lens sweeps            (`specialists.py`)
+5. `history`       — sibling sites of a previously-patched idiom  (`history.py`
                      wrote them into `logs/history.json`; we merge them in)
-5. `catchall`      — the terminal coverage net                 (`catchall.py`)
+6. `catchall`      — the terminal coverage net                 (`catchall.py`)
+
+**Why there is a third source between the two taint ones.** Sources 1 and 2 are
+both anchored on the sink tables: forward taint needs both ends known, and
+sink-backward needs the sink known. Neither can reach a dangerous operation
+nobody put in a table. On the recorded run that showed up as forward taint
+producing **two** tasks against a 1022-edge, high-confidence graph, while the
+phase-3 sweep and reconciliation later added 35 tasks that produced 49 of the
+145 findings. A third of the run's output came from work the initial generator
+never queued. `entry_forward` asks the opposite question — *what can this input
+reach?* — and is gated on nothing, because gating it on the same reachability
+signal that suppressed forward taint would reproduce the gap it exists to
+close.
 
 Ported from `pyhunt_old/orchestrator.py::_add_taint_tasks` /
 `_add_sink_backward_tasks` / `_add_specialist_tasks` / `_sweepable_source_files`
@@ -493,6 +507,310 @@ def gen_sink_backward(
     return kept, status
 
 
+# ---------------------------------------------------------------------------
+# Entry-forward (W4.3)
+#
+# In the recorded run, 20 of 37 initial tasks were sink-backward and forward
+# taint produced **two**, against a graph with 1022 call edges and high
+# confidence. The sweep and reconciliation then added 35 more tasks which
+# produced 49 of the 145 findings — a third of the total came from work the
+# initial generator never queued. That is a measurable under-generation, and it
+# has a structural cause:
+#
+#   Sink-backward finds what is reachable FROM a known sink. Forward taint
+#   finds a path only when BOTH ends are already known. Neither can find a
+#   sink the table does not carry — and `taint.py`'s tables are a list of the
+#   dangerous idioms someone thought of.
+#
+# Entry-forward closes that: for every enumerated entry point, one task that
+# follows it forward **regardless of whether a sink was found behind it**. The
+# hunter is asked what this data can reach, not asked to confirm a path the
+# generator already drew.
+# ---------------------------------------------------------------------------
+ENTRY_FORWARD_MAX_TASKS = 30
+ENTRY_FORWARD_MAX_FILES_PER_TASK = 3
+
+# What an entry point of this kind most plausibly reaches. Each value routes to
+# a real class file (see `phase2_hunt.md`'s routing table); an entry point whose
+# category implies nothing specific still gets a task, under the generic
+# input-handling lens, because the point is that it gets looked at at all.
+_CATEGORY_CLASS: dict[str, str] = {
+    "deserialise": "deserialization",
+    "message_queue": "deserialization",
+    "template": "code_injection",
+    "cli": "command_injection",
+    "file_read": "path_traversal",
+    "network_response": "ssrf",
+    "http_flask": "improper_input_handling",
+    "http_django": "improper_input_handling",
+    "http_fastapi": "improper_input_handling",
+    "http_other": "improper_input_handling",
+    "websocket": "improper_input_handling",
+    "webhook": "auth_bypass",
+    "environment": "information_disclosure",
+    "ci_trigger": "supply_chain",
+}
+_ENTRY_FORWARD_DEFAULT_CLASS = "improper_input_handling"
+
+# Tier order for prioritisation. Nothing is dropped by tier; this only decides
+# what gets queued first when the cap bites, and the cap is reported.
+_TIER_PRIORITY: dict[str, int] = {
+    "public_api": 0, "internal": 1, "ci": 2, "build": 3,
+    "example": 4, "test": 5,
+}
+
+
+def load_recon_enumeration(results_dir: Path) -> dict:
+    """Read `logs/recon_enumeration.json`, or an empty payload if absent.
+
+    Absent is a normal outcome — an older run, or a repo where the enumerator
+    could not run. Entry-forward then falls back to `inputs.json` alone, which
+    is weaker but not nothing.
+    """
+    path = Path(results_dir) / "logs" / "recon_enumeration.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = _read_json(path)
+    except Exception as exc:  # fail-open — never abort task generation
+        log.warning("recon_enumeration.json unreadable (continuing): %s", exc)
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _entry_points_by_file(
+    recon: dict, inputs: list[dict], enumeration: dict,
+) -> dict[str, dict]:
+    """Collapse every known entry point into one record per file.
+
+    Three sources, deliberately unioned rather than ranked: the recon agent's
+    `inputs[]`, its `architecture.entry_points[]`, and the deterministic
+    enumerator's `entry_point_candidates`. The agent sees things the regex
+    cannot and the regex sees things the agent ran out of context for; taking
+    the union is the only combination that does not silently prefer one.
+    """
+    by_file: dict[str, dict] = {}
+
+    def note(path: str, category: str, location: str, tier: str) -> None:
+        if not path:
+            return
+        row = by_file.setdefault(path, {
+            "categories": set(), "locations": [], "tier": tier, "count": 0,
+        })
+        row["categories"].add(category)
+        row["count"] += 1
+        if len(row["locations"]) < 5:
+            row["locations"].append(location)
+        if _TIER_PRIORITY.get(tier, 9) < _TIER_PRIORITY.get(row["tier"], 9):
+            row["tier"] = tier
+
+    file_tier = {
+        r.get("path"): r.get("reachable_from", "public_api")
+        for r in enumeration.get("files", []) if isinstance(r, dict)
+    }
+
+    for record in inputs:
+        location = str(record.get("location") or "")
+        path = location.split(":", 1)[0]
+        note(path, "recon_input", location, file_tier.get(path, "public_api"))
+
+    architecture = recon.get("architecture") or {}
+    for entry in architecture.get("entry_points", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        location = str(entry.get("location") or "")
+        path = location.split(":", 1)[0]
+        note(path, "recon_entry_point", location,
+             file_tier.get(path, "public_api"))
+
+    # Framework confidence is deliberately NOT consulted here. A candidate hit
+    # is a line of this repository's own code that matched a source pattern —
+    # `request.args` in a file is a real read whatever the lock file says. The
+    # `transitive` grade exists to stop the recon *agent* enumerating a
+    # framework's whole API surface from a dependency name; it is not a reason
+    # to ignore code that is actually present.
+    candidates = enumeration.get("entry_point_candidates") or {}
+    for category, block in candidates.items():
+        if not isinstance(block, dict):
+            continue
+        for hit in block.get("hits", []) or []:
+            if not isinstance(hit, dict):
+                continue
+            location = str(hit.get("location") or "")
+            path = location.split(":", 1)[0]
+            note(path, category, location,
+                 hit.get("reachable_from") or file_tier.get(path, "public_api"))
+
+    # The public API of a library IS its attack surface. A file that exports
+    # callables and matched no source pattern still gets an entry-forward task —
+    # that is precisely the case forward taint cannot see.
+    for symbol in enumeration.get("public_api", []) or []:
+        if not isinstance(symbol, dict) or "symbol" not in symbol:
+            continue
+        path = str(symbol.get("path") or "")
+        note(path, "public_api",
+             f"{path}:{symbol.get('line', 0)} {symbol.get('symbol')}",
+             symbol.get("reachable_from") or file_tier.get(path, "public_api"))
+
+    return by_file
+
+
+def build_entry_forward_tasks(
+    recon: dict, inputs: list[dict], enumeration: dict, covered: set[str],
+    *, max_tasks: int = ENTRY_FORWARD_MAX_TASKS,
+) -> tuple[list[dict], dict]:
+    """One task per entry-point file, uncovered and most-public first."""
+    by_file = _entry_points_by_file(recon, inputs, enumeration)
+    if not by_file:
+        return [], {"status": "skipped:no_entry_points", "tasks": 0}
+
+    ranked = sorted(
+        by_file.items(),
+        key=lambda kv: (
+            kv[0] in covered,                        # uncovered files first
+            _TIER_PRIORITY.get(kv[1]["tier"], 9),    # then most reachable
+            -kv[1]["count"],                         # then densest surface
+            kv[0],                                   # then stable by name
+        ),
+    )
+
+    # Group rather than truncate. The first version of this capped at
+    # `max_tasks` files and deferred the other 45 of 75 — which is the exact
+    # failure this source exists to fix, reintroduced one layer down. Files
+    # that share an attack class and a directory are read together anyway, so
+    # bundling them costs a hunter almost nothing and covers every entry point.
+    def class_of(row: dict) -> str:
+        for category in sorted(row["categories"]):
+            mapped = _CATEGORY_CLASS.get(category)
+            if mapped:
+                return mapped
+        return _ENTRY_FORWARD_DEFAULT_CLASS
+
+    groups: dict[tuple[str, str], list[tuple[str, dict]]] = {}
+    order: list[tuple[str, str]] = []
+    for path, row in ranked:
+        key = (class_of(row), str(PurePosixPath(path).parent))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append((path, row))
+
+    tasks: list[dict] = []
+    bundles: list[tuple[str, list[tuple[str, dict]]]] = []
+    for attack_class, directory in order:
+        members = groups[(attack_class, directory)]
+        for start in range(0, len(members), ENTRY_FORWARD_MAX_FILES_PER_TASK):
+            bundles.append(
+                (attack_class, members[start:start + ENTRY_FORWARD_MAX_FILES_PER_TASK]))
+
+    # If grouping still overflows, widen the bundles. Bundling stays within a
+    # (class, directory) group even then: three files in one package read as
+    # one coherent assignment, three scattered across the repo read as "here is
+    # the repo, find bugs", which is the thing this generator exists to avoid.
+    # So the cap is a *target*, not a ceiling — when coherent grouping cannot
+    # reach it, the task count wins and the overflow is stated. Dropping a file
+    # to hit a number would reintroduce the exact defect this source fixes.
+    widened = False
+    if len(bundles) > max_tasks:
+        widened = True
+        per_task = max(
+            ENTRY_FORWARD_MAX_FILES_PER_TASK,
+            -(-len(ranked) // max_tasks),  # ceil
+        )
+        bundles = []
+        for attack_class, directory in order:
+            members = groups[(attack_class, directory)]
+            for start in range(0, len(members), per_task):
+                bundles.append((attack_class, members[start:start + per_task]))
+
+    for index, (attack_class, members) in enumerate(bundles, 1):
+        paths = [p for p, _ in members]
+        total_points = sum(r["count"] for _, r in members)
+        categories = sorted({c for _, r in members for c in r["categories"]})
+        uncovered = [p for p in paths if p not in covered]
+        sample = "; ".join(
+            loc for _, row in members[:2] for loc in row["locations"][:2])
+        tasks.append({
+            "task_id": f"t_ef_{index:02d}",
+            "source": "entry_forward",
+            "attack_class": attack_class,
+            "target_files": paths,
+            "scope_hint": (
+                f"Follow every entry point in these {len(paths)} file(s) "
+                f"FORWARD and report what attacker-influenced data can reach. "
+                f"Entry points include: {sample}. Do not confine yourself to "
+                f"{attack_class} — that is the class this surface suggests, "
+                f"not a boundary. If the data reaches a dangerous operation of "
+                f"any class, file it under that class."
+            ),
+            "rationale": (
+                f"Entry-forward coverage (W4.3). {total_points} entry point(s) "
+                f"across {', '.join(categories)}; "
+                f"{len(uncovered)} of {len(paths)} file(s) reached by no other "
+                f"task. Queued regardless of whether a sink was found behind "
+                f"them, because sink-backward can only find what the sink "
+                f"tables already name, and forward taint needs both ends known."
+            ),
+            "priority": 2 if uncovered else 3,
+        })
+
+    queued_files = {p for t in tasks for p in t["target_files"]}
+    status = {
+        "status": "ok",
+        "tasks": len(tasks),
+        "entry_point_files": len(by_file),
+        "entry_point_files_queued": len(queued_files),
+        "uncovered_queued": len(queued_files - covered),
+    }
+    if widened:
+        over = len(tasks) - max_tasks
+        status["note"] = (
+            f"grouped {len(by_file)} entry-point files into {len(tasks)} tasks; "
+            f"target was {max_tasks} and grouping is confined to one attack "
+            f"class within one directory, so it landed "
+            + (f"{over} over" if over > 0 else "at or under target")
+            + ". No file was dropped — the count is the honest cost of covering "
+              "every entry point."
+        )
+    missed = set(by_file) - queued_files
+    if missed:
+        # Should be unreachable — recorded rather than trusted, because a
+        # silently shrinking denominator is the failure this source exists for.
+        status["not_queued"] = sorted(missed)[:20]
+    return tasks, status
+
+
+def gen_entry_forward(
+    recon: dict, inputs: list[dict], results_dir: Path, covered: set[str],
+    notes: list[str],
+) -> tuple[list[dict], dict]:
+    """Entry-point-forward tasks. **Fail-open**, and gated on nothing.
+
+    Deliberately not gated on the call graph: this source exists to cover the
+    case where the graph, the sink tables, or both are the reason a finding was
+    missed. Gating it on the same reachability signal that already suppressed
+    forward taint would reproduce the gap it is here to close.
+    """
+    try:
+        enumeration = load_recon_enumeration(results_dir)
+        tasks, status = build_entry_forward_tasks(
+            recon, inputs, enumeration, covered)
+    except Exception as exc:  # fail-open — never abort a run
+        log.warning("entry-forward failed (continuing run): %s", exc)
+        return [], {"status": f"failed:{type(exc).__name__}: {exc}", "tasks": 0}
+    if not enumeration:
+        notes.append(
+            "entry_forward: logs/recon_enumeration.json absent — entry points "
+            "taken from inputs.json alone, so the public API surface was not "
+            "covered. Run scripts/recon_enumerate.py before phase 1b."
+        )
+    kept, dropped = _validate_tasks(tasks, "entry_forward", notes)
+    status["tasks"] = len(kept)
+    if dropped:
+        status["dropped_invalid"] = dropped
+    return kept, status
+
+
 def gen_specialist(
     recon: dict, inputs: list[dict], repo_path: Path, source_files: list[str],
     notes: list[str],
@@ -703,13 +1021,24 @@ def generate(repo_path: Path, results_dir: Path, *,
             "a known language extension or IaC/CI shape"
         )
 
-    # 4. Gated repo-wide specialist sweeps.
+    # 4. Entry-point-forward coverage (W4.3). Placed after taint and
+    #    sink-backward so `covered` is real, and before the specialist sweeps
+    #    and catchall so those two see the files it claims. Gated on nothing:
+    #    this source exists to cover the case where the graph or the sink
+    #    tables are the reason something was missed.
+    ef_covered = _covered_files(queued)
+    entry_tasks, sources["entry_forward"] = gen_entry_forward(
+        inputs_payload, inputs, results_dir, ef_covered, notes
+    )
+    queued.extend(entry_tasks)
+
+    # 5. Gated repo-wide specialist sweeps.
     spec_tasks, sources["specialist"] = gen_specialist(
         inputs_payload, inputs, repo_path, source_files, notes
     )
     queued.extend(spec_tasks)
 
-    # 5. History-seeded sibling tasks — merged BEFORE catchall so their files
+    # 6. History-seeded sibling tasks — merged BEFORE catchall so their files
     #    count as covered.
     hist_tasks, sources["history"] = gen_history(results_dir, notes)
     queued.extend(hist_tasks)
@@ -717,7 +1046,7 @@ def generate(repo_path: Path, results_dir: Path, *,
     # Ids must be unique across sources before `covered` is computed from them.
     queued = _dedupe_ids(queued, notes)
 
-    # 6. The terminal coverage sweep. LAST, so `covered` is the union of
+    # 7. The terminal coverage sweep. LAST, so `covered` is the union of
     #    everything above. Run it earlier and the sweep re-hunts covered ground
     #    while reporting full coverage.
     covered = _covered_files(queued)

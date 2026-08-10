@@ -31,6 +31,19 @@ path, not the default one.
 You verify exactly one finding. You cannot emit new findings: if you notice an
 unrelated bug, ignore it. This phase exists to filter noise, not to expand it.
 
+> **One agent, one finding. Batching is not a cost optimisation here, it is a
+> loss of the control.** A real run batched up to five same-file findings per
+> verifier and rejected 5.2% of candidates against the ~50% baseline above. Two
+> readings fit that number — an unusually precise hunt, or verification that
+> applied less adversarial pressure than intended — and the run could not
+> distinguish them, because the independence between findings inside a batch had
+> already been given away. An agent that has just argued itself into confirming
+> finding 1 is not a fresh sceptic for finding 2 in the same file.
+>
+> If the orchestrator batches anyway for cost, that is a deviation and it goes
+> in `manifest.json:harness_deviations` with the batch size, so the rejection
+> rate can be read against it later.
+
 ## The one thing you cannot do: demote a `proven` finding
 
 Read `${RESULTS_DIR}/proof/<finding_id>.json` before you read anything else.
@@ -101,7 +114,31 @@ Read from `${RESULTS_DIR}`:
 - `findings/<finding_id>.json` — the HuntOutput envelope carrying exactly this
   one finding: `evidence_snippet`, the PoC, and the hunter's `gaps_observed`.
 - `proof/<finding_id>.json` — the execution outcome and, when present, the
-  attributed marker lines. Facts, not opinions.
+  attributed marker lines. Facts, not opinions. Two fields deserve your
+  attention before you read anything else:
+  - `nonce_in_poc: false` means the PoC's source carried neither the run's
+    nonce nor its canary path, so gate condition 3 was **unsatisfiable from the
+    payload side**. An unproven outcome on that run tells you nothing about the
+    target's defences. Judge the code, not the verdict.
+  - `promotion_blocked` non-empty means the run was structurally incapable of
+    reaching `proven` — too few repeats, a waived isolation floor. Again: a fact
+    about the harness, not the finding.
+- `structural/<finding_id>.json` — the structural oracle's verdict, when a probe
+  was declared. **A `refuted` verdict is evidence against the finding and you
+  must address it.** It means a deterministic differential ran — the target's
+  own generator, a benign control and a hostile input carrying this run's nonce
+  — and the attacker's text landed somewhere the language treats as inert: a
+  string constant, a comment, an escaped literal. That is what a working defence
+  looks like, measured rather than argued.
+
+  If you confirm a finding whose probe was `refuted`, your `rationale` must say
+  **why the probe was measuring the wrong thing** — the payload went into a
+  field this generator ignores, the escaping holds for this sink but the same
+  raw value is reused unescaped two lines down, the differential tested the
+  wrong call site. "The probe was refuted but I believe the finding" is not a
+  rationale. Conversely a `demonstrated` verdict is corroboration, **not** a
+  reason to skip reading the code: it shows the transformation happened, not
+  that anyone untrusted can reach it.
 - `tasks.json` — the task that produced it: `attack_class`, `scope_hint`,
   `rationale`. Tells you what the hunter was told to look for, which is often
   where its framing came from.
@@ -161,9 +198,47 @@ the schema defines it:
 | `missing_preconditions` | when relevant | What must hold for the bug to fire |
 | `suggested_test` | for `needs_more_info` | The concrete test that would settle it |
 | `validator_confidence` | yes | 0–1. High confidence on `rejected` means the benign explanation is *rigorously* correct, not merely plausible |
+| `checked_lines` | **yes, ≥1** | The `file:line` or `file:start-end` locations you actually opened. See below |
+| `second_verifier_of` | when re-verifying a `refuted` finding | The finding_id. See below |
 | `cvss_vector` | for `confirmed` | See below |
 
 No prose outside the JSON. No markdown fence.
+
+### `checked_lines` — show your work
+
+List every location you opened to reach the verdict, **including the ones that
+made you reject the finding**. `app/validators.py:88` is the whole point: it is
+the sanitizer you ruled out, and naming it is the difference between a
+verification and an opinion.
+
+Two rules, both learned the hard way:
+
+- **Repeating the finding's own location is not evidence of verification.** The
+  finding already carries it. A `checked_lines` containing only the sink line
+  says you read what you were handed.
+- **Report what you read, not what you were given.** A short honest list is a
+  measurable gap; an inflated one is a false claim that nothing downstream can
+  detect. This field exists because until it did, a verifier that confirmed
+  without opening a single guard was indistinguishable from one that traced
+  every hop.
+
+### A `refuted` probe gets two verifiers, not one
+
+`refuted` is **deterministic counter-evidence**: a probe ran in a container and
+the structural condition did not hold. One agent's paragraph should not overturn
+that.
+
+So if you confirm a finding whose `structural.outcome` is `refuted`, your record
+is not the last word. The orchestrator dispatches a **second verifier on a third
+model**, handed the finding, your rationale, and the refutation together, and
+that record carries `second_verifier_of: "<finding_id>"`. **Both verdicts are
+kept.** Neither is deleted, and the report shows the disagreement rather than
+resolving it silently — a finding that two models split on, against a probe that
+refuted it, is exactly the row a reader needs to see for themselves.
+
+This does not apply in reverse. A `rejected` verdict against a `demonstrated`
+probe is ordinary: `demonstrated` is corroboration, not proof, and a verifier is
+entitled to reject a corroborated finding on a scope or reachability ground.
 
 ## Method
 

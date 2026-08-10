@@ -70,8 +70,8 @@ path and deciding whether the value survives it intact.
 
 ## What the generator does, in order
 
-`tasks.py generate` composes five modules. The order is load-bearing: the
-catch-all sweep must see everything the other four queued, or its coverage
+`tasks.py generate` composes six sources. The order is load-bearing: the
+catch-all sweep must see everything the other five queued, or its coverage
 claim is wrong.
 
 ### 1. Build the call graph — `scripts/graph/`
@@ -173,7 +173,55 @@ This source is also the structural answer to under-enumeration in Phase 1. It
 cannot repair a missing input in the ledger, but it means a missed input does
 not automatically mean a missed sink.
 
-### 4. Repo-wide specialist sweeps — `scripts/specialists.py`
+### 4. Entry points, followed forward — `entry_forward` (W4.3)
+
+```python
+build_entry_forward_tasks(recon, inputs, enumeration, covered, max_tasks=30)
+```
+
+Steps 2 and 3 are both anchored on the **sink tables**. Forward taint fires only
+when both ends are already known; sink-backward fires only when the sink is
+already known. Neither can reach a dangerous operation nobody tabulated — and
+the sink tables are, ultimately, a list of the idioms somebody thought of.
+
+On the recorded run that gap was measurable. Forward taint produced **2 tasks**
+against a graph with 1022 call edges at high confidence. The phase-3 sweep and
+reconciliation then added 35 tasks which produced **49 of the 145 findings** —
+a third of the run's output came from work this phase never queued, discovered
+late and expensively.
+
+So this source asks the opposite question: *what can this input reach?* For
+every entry point known from any of three sources — `inputs[]`,
+`architecture.entry_points[]`, and `recon_enumeration.json`'s candidate sweep
+and public API surface — it queues a task that follows it forward, **whether or
+not a sink was found behind it**.
+
+Three properties, each load-bearing:
+
+- **Gated on nothing.** Not on the call graph, not on the reachability signal.
+  Gating this on the same signal that suppressed forward taint would reproduce
+  the gap it exists to close.
+- **The union of all three entry-point sources, never a ranking.** The recon
+  agent sees things a regex cannot; the regex sees what the agent ran out of
+  context for. Preferring either one loses the difference.
+- **No file is dropped to hit the cap.** Files sharing an attack class and a
+  directory are bundled up to three per task; if that still overflows,
+  `max_tasks` is treated as a target and the overflow is stated in
+  `sources.entry_forward.note`. The first implementation capped at 30 files and
+  deferred 45, which is this very defect one layer down.
+
+The `attack_class` is derived from the candidate category that matched
+(`deserialise` → `deserialization`, `template` → `code_injection`, a CI trigger
+→ `supply_chain`, and so on), defaulting to `improper_input_handling`. Every
+`scope_hint` says in as many words that the class is **the surface's
+suggestion, not a boundary** — a hunter who finds an RCE while assigned
+`improper_input_handling` files the RCE. The recorded run's one proven finding
+was mislabelled in exactly that direction (D18).
+
+`source: "entry_forward"`, `priority: 2` when the file is reached by no other
+task and `3` when it is, ids `t_ef_01`…
+
+### 5. Repo-wide specialist sweeps — `scripts/specialists.py`
 
 ```python
 source_files = sweepable_source_files(repo_path, gq)
@@ -216,7 +264,7 @@ Two details worth knowing when reading the output:
 Every gated-**off** lens is recorded in `tasks.json` with its reason. A
 specialist that did not run is a coverage fact, and Phase 4 reports it.
 
-### 5. The catch-all coverage sweep — `scripts/catchall.py`
+### 6. The catch-all coverage sweep — `scripts/catchall.py`
 
 ```python
 tasks, dropped = build_catchall_tasks(all_source_files, covered, graph=gq,
@@ -270,7 +318,7 @@ If the array is absent, the phase proceeds — this source is additive.
 
 ## Fail-open, but never silent
 
-Each of the five sources is independently fail-open: a crash inside the
+Each of the six sources is independently fail-open: a crash inside the
 specialist gates must not lose the taint tasks that were already generated.
 Task generation never aborts the run.
 
@@ -306,6 +354,9 @@ container as a clean scan.
   "sources": {
     "taint":         {"status": "ok", "tasks": 34},
     "sink_backward": {"status": "ok", "tasks": 11},
+    "entry_forward": {"status": "ok", "tasks": 41,
+                      "entry_point_files": 75,
+                      "entry_point_files_queued": 75},
     "specialist":    {"status": "ok", "tasks": 4,
                       "active": ["logic-bug", "access-control",
                                  "deserialization", "codegen"],
@@ -320,8 +371,8 @@ container as a clean scan.
     "covered_files": 297,
     "catchall_dropped": 0
   },
-  "totals": {"taint": 34, "sink_backward": 11, "specialist": 4,
-             "history": 0, "catchall": 18, "total": 67},
+  "totals": {"taint": 34, "sink_backward": 11, "entry_forward": 41,
+             "specialist": 4, "history": 0, "catchall": 18, "total": 108},
   "tasks": [
     {
       "task_id": "t_taint_01",

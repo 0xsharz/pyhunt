@@ -128,6 +128,39 @@ like SQL injection. Push back once, deliberately:
    against a subsystem where it makes sense (`xxe` against an XML parser, not
    against a CSV reader).
 
+### 3a. Re-queue every DISMISSED surface under the other lenses
+
+This is the recall step, and it exists because of a miss that cost two real
+findings. A sweep cleared an entire `.fake()` surface with the reasoning:
+
+> "`random.choice` / `random.randint` / `uuid.uuid1` / `uuid.uuid3` all appear
+> exclusively inside `.fake()` methods, whose entire job is synthetic test data."
+
+Correct for the question it was asking — weak randomness — and wrong for the one
+it was not: two of those methods read a schema-supplied `size` and `max_digits`
+straight into an allocation. The surface had been *cleared under one lens* and
+the ledger recorded it as covered, so nothing ever looked again.
+
+So: **"cleared under lens X" is not "covered".** Scan every `gaps_observed`
+entry whose `reason` begins `cleared for <class>:` (`phase2_shared.md` §8
+requires that form) and, for each one, queue a task under **every other lens
+whose `_LENS_SIGNALS` would touch that path** — `scripts/specialists.py` holds
+the signal table. Set the new task's `rationale` to name both the original
+dismissal and the new question:
+
+```json
+{"task_id": "t_dis_3", "source": "dismissal",
+ "attack_class": "resource_exhaustion",
+ "target_files": ["dataclasses_avroschema/fields/fields.py"],
+ "scope_hint": "the .fake() methods, asked about SIZE rather than randomness",
+ "rationale": "cleared for weak_crypto (\"synthetic test data\"); the resource lens has not asked whether a schema-supplied size reaches an allocator here"}
+```
+
+Bounded like everything else in this phase — cap at the same fan-out limit — and
+if the cap truncates the re-queue, say how many were dropped. A dismissal that
+was never re-examined under another lens is itself a `gaps_observed` entry for
+the report.
+
 ## Emitting tasks
 
 Append to `${RESULTS_DIR}/tasks.json`. Each task validates against
@@ -199,24 +232,114 @@ So the run does not get to end until every enumerated input carries a
 disposition. **`coverage.py` asserts it, and the run fails rather than reporting
 an incomplete scan as a complete one.**
 
-## The three commands, in order
+## The commands, in order
 
 ```bash
 # 1. Give every enumerated input a disposition and the evidence for it.
 python3 "${PYHUNT_DIR}/scripts/coverage.py" classify \
   --results-dir "${RESULTS_DIR}"
 
-# 2. Re-queue the uncovered ones as hunt tasks (bounded).
+# 2. Re-queue the uncovered ones as hunt tasks (bounded). THIS WRITES
+#    tasks.json — it appends, backs the file up first, and reports `written`.
 python3 "${PYHUNT_DIR}/scripts/coverage.py" reconcile \
   --results-dir "${RESULTS_DIR}"
 
 #    → run the emitted t_rc_* tasks through phase 2 → 2b → 2c,
 #      then re-run `classify` so their results land in the ledger.
 
-# 3. Assert the ledger is complete. Exit 2 = the run fails.
+# 3. Re-ask every dismissed surface under the lenses that did not dismiss it.
+python3 "${PYHUNT_DIR}/scripts/lens_matrix.py" run \
+  --results-dir "${RESULTS_DIR}"
+
+# 4. Re-queue findings the structural oracle could settle and was never asked to.
+python3 "${PYHUNT_DIR}/scripts/coverage.py" probe-gap \
+  --results-dir "${RESULTS_DIR}"
+
+#    → steps 3 and 4 emit tasks. Run them through phase 2 → 2b → 2c like any
+#      other, then return here.
+
+# 5. Report which assigned files no unit ever opened.
+python3 "${PYHUNT_DIR}/scripts/coverage.py" read-ledger \
+  --results-dir "${RESULTS_DIR}"
+
+#    → for each file in `unread_files` that belongs to a task whose outcome was
+#      `clean`, queue it. A clean verdict over a file nobody opened is not a
+#      clean verdict.
+
+# 6. Repair any class that disagrees with its own CWE, then collapse same-site
+#    findings. Order matters: dedupe groups by class family, so a mislabelled
+#    finding groups into the wrong one.
+python3 "${PYHUNT_DIR}/scripts/findings_io.py" class-repair \
+  --results-dir "${RESULTS_DIR}"
+python3 "${PYHUNT_DIR}/scripts/dedupe.py" run \
+  --results-dir "${RESULTS_DIR}"
+
+#    Then the tier above it: group same-root-cause SITES into advisories.
+#    dedupe answers "is this the same line"; this answers "is this the same
+#    defect", which is the question a maintainer actually has.
+python3 "${PYHUNT_DIR}/scripts/cluster.py" run \
+  --results-dir "${RESULTS_DIR}"
+
+# 7. Assert the ledger is complete. Exit 2 = the run fails.
 python3 "${PYHUNT_DIR}/scripts/coverage.py" assert-complete \
   --results-dir "${RESULTS_DIR}"
 ```
+
+**Check that step 2 actually wrote.** Its JSON reports `written`, `tasks_total`
+and `backup_path`; if `written` is 0 while `requeued` is not, stop. This step
+used to print the tasks on stdout and mutate nothing, with no phase file saying
+who was supposed to perform the append — so on a real run it emitted 20 `t_rc_*`
+tasks against 54 uncovered inputs, `tasks.json` was unchanged, and **every gate
+downstream still passed**, because `uncovered` is a legal disposition. The
+result would have been a report claiming an honest ledger over a re-queue step
+that silently did nothing.
+
+**Steps 3 and 4 are the recall pair, and both used to be prose.**
+`lens_matrix.py` reads every `gaps_observed` entry of the form
+`cleared for <class>: <why>`, resolves the lens that cleared it, and emits a
+task for every *other* lens whose path signals touch that file. Fed the exact
+wording that lost two findings — *"random.choice / random.randint / uuid.uuid1
+all appear exclusively inside `.fake()` methods, whose entire job is synthetic
+test data"* — it produces a `resource_exhaustion` task on `fields.py`, which is
+precisely the question nobody asked.
+
+`coverage.py probe-gap` does the same for the second oracle: a finding whose
+class the audit hook cannot see, carrying no `structural_probe`, becomes a task
+whose job is to author one. On the recorded run that would have been **88
+findings across 14 sites**, against 1 probe actually declared. An oracle nobody
+is required to invoke produces the same report as no oracle.
+
+Both write their tasks, back `tasks.json` up first, and read it back — because
+the failure they exist to prevent is a step that reports success and changes
+nothing.
+
+**Step 5 is the third member of that family, and it is a report rather than a
+gate.** `coverage.py read-ledger` joins each hunt unit's `files_read` against
+its task's `target_files` and names every file that was assigned and never
+opened. The coverage ledger cannot see this: it is input-level, so a unit given
+five files that answers from two still produces a task outcome, input
+dispositions, and a full coverage number.
+
+It does not exit 2, deliberately. A file legitimately goes unread — answered
+from elsewhere, or generated — and failing the run for it would push units
+toward inflating `files_read`, converting a measurable gap into an unmeasurable
+lie. Naming the file is what makes it actionable.
+
+**Step 5 is what stops the report drowning the reader.** `dedupe.py` groups
+findings by (file, class family, adjacent line range), picks the canonical by
+evidence rather than by luck — proven beats demonstrated beats severity, with a
+deterministic tie-break so two runs over the same inputs agree — and stamps
+`group_id` / `is_canonical` / `independent_units`. Nothing is deleted:
+non-canonical records keep their file, their PoC and their verdict, and phase 4
+renders them as located "also at" references.
+
+Both halves matter. On a real run 127 delivered findings sat on 81 distinct
+sites (`base.py:240` was filed five separate times), and a reader had to do the
+deduplication the tool should have done. But 21 of 55 sites had been filed
+independently by two or more hunt units that could not see each other's work,
+and *that* is corroboration — several agents, each reading only its own scope,
+landing on the same line. It used to be thrown away by the very step that
+noticed it. `independent_units` keeps it, and phase 4 prints it.
 
 `classify` writes `${RESULTS_DIR}/coverage.json`:
 

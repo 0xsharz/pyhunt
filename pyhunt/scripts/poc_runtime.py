@@ -45,7 +45,7 @@ OBSERVER_DIR = Path(__file__).resolve().parent / "observers"
 # Every marker line an observer prints starts with this, so a single grep
 # separates instrumentation output from the PoC's own chatter.
 from oracle.markers import MARKER  # single definition, shared with the gate
-from oracle.nonce import canary_path
+from oracle.nonce import canary_path, nonce_for
 
 # Appended to every Observer.notes. The wording is deliberately blunt: this is
 # the one inference that would turn optional instrumentation into a source of
@@ -278,7 +278,9 @@ def materialize_observer(rt: Runtime, scratch_dir: Path) -> list[Path]:
 def poc_execution_block(languages: list[str], project_env: dict | None,
                         scratch_dir: Path, *,
                         materialize: bool = False,
-                        nonce: str | None = None) -> dict | None:
+                        nonce: str | None = None,
+                        run_id: str | None = None,
+                        task_id: str | None = None) -> dict | None:
     """The per-task PoC recipe injected into the Hunt agent's `user_input`.
 
     Returns None when no Runtime matches — Hunt then falls back to its existing
@@ -290,10 +292,34 @@ def poc_execution_block(languages: list[str], project_env: dict | None,
     and `observer["files"]` is empty. Pass `materialize=True` only when the
     scratch dir is real and the agent is actually going to run the PoC — i.e.
     inside the sandbox.
+
+    **A null nonce is not producible by omission.** This used to accept
+    ``nonce=None`` and quietly emit ``"nonce": null`` with a null canary path,
+    which is a silent, total loss of gate condition 3: the payload carries no
+    run-derived value, so replay has nothing to match and a real proof degrades
+    to ``sink_reached_unproven``. It happened — 24 tasks of a real run were
+    dispatched that way, and it was caught only because every hunt agent
+    noticed and said so unprompted. So now: pass a nonce, or pass
+    ``run_id``/``task_id`` and one is minted here via
+    :func:`oracle.nonce.nonce_for`; pass neither and this raises.
     """
     rt = runtime_for(languages, project_env)
     if rt is None:
         return None
+
+    if not nonce:
+        if run_id and task_id:
+            nonce = nonce_for(run_id, task_id)
+        else:
+            raise ValueError(
+                "poc_execution_block needs a nonce: pass `nonce=`, or pass "
+                "`run_id=` and `task_id=` so one can be derived with "
+                "oracle.nonce.nonce_for(run_id, task_id). Emitting a block with "
+                "a null nonce silently disables gate condition 3 — the payload "
+                "would carry nothing replay could attribute to this PoC, and a "
+                "real proof would come back `sink_reached_unproven` with no "
+                "indication why."
+            )
 
     observer: dict | None = None
     if rt.observer is not None:
@@ -341,4 +367,19 @@ def poc_execution_block(languages: list[str], project_env: dict | None,
         # two independent paths to the same attribution.
         "nonce": nonce,
         "canary_path": canary_path(nonce) if nonce else None,
+        # Stated in the block itself because getting this backwards costs a
+        # real proof and leaves no trace: a PoC written as
+        # `os.environ.get("PYHUNT_NONCE") or "<literal>"` silently uses the
+        # literal, every time, and the run reports `sink_reached_unproven` —
+        # which is indistinguishable, in the report, from a working defence.
+        "nonce_transport": (
+            "Embed this nonce as a LITERAL in the payload, at authoring time. "
+            "`os.environ.get('PYHUNT_NONCE')` is ALWAYS None inside a PoC: "
+            "pyhunt_audit_hook pops PYHUNT_NONCE and PYHUNT_OBSERVER_KEY out of "
+            "os.environ at import, before any PoC or target code runs. That "
+            "deletion is deliberate anti-forgery (a hostile repository must not "
+            "be able to read the nonce and print a well-formed marker line), so "
+            "reading the nonce from the environment is not merely discouraged — "
+            "it is guaranteed to fail, quietly."
+        ),
     }

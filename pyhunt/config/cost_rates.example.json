@@ -1,0 +1,48 @@
+{
+  "_README": [
+    "Copy this file, put YOUR prices in it, and pass it as --rates to",
+    "scripts/cost.py. PyHunt ships no rate card and never will: a price",
+    "depends on the contract you are billed under and on a date, neither of",
+    "which is visible from inside a scan. Every number below is a PLACEHOLDER",
+    "and is deliberately zero, so an unedited copy produces a total of 0.00",
+    "rather than a plausible-looking figure nobody checked.",
+    "",
+    "'source' and 'as_of' are required. cost.py refuses a table without them,",
+    "because a dollar figure with no provenance is exactly the unfalsifiable",
+    "claim this tool exists to avoid — it just happens to be about money.",
+    "",
+    "Keys under per_million_tokens match a model id exactly, or by longest",
+    "prefix: 'claude-opus-5' matches 'claude-opus-5-20260101'. A model with no",
+    "matching key contributes nothing and is named in cost.json's",
+    "unpriced_models, which makes the total a stated floor rather than a",
+    "silent undercount.",
+    "",
+    "The four rates are priced differently on every card that distinguishes",
+    "them at all. Cache reads dominate token COUNT on a long run — 98.8% of",
+    "traffic on the recorded scan — while costing the least per token, which",
+    "is why cost.py never sums them into a single headline."
+  ],
+  "source": "REPLACE ME — where these prices came from",
+  "as_of": "REPLACE ME — YYYY-MM-DD",
+  "currency": "USD",
+  "per_million_tokens": {
+    "claude-opus-5": {
+      "input": 0.0,
+      "output": 0.0,
+      "cache_write": 0.0,
+      "cache_read": 0.0
+    },
+    "claude-sonnet-5": {
+      "input": 0.0,
+      "output": 0.0,
+      "cache_write": 0.0,
+      "cache_read": 0.0
+    },
+    "claude-haiku-4-5": {
+      "input": 0.0,
+      "output": 0.0,
+      "cache_write": 0.0,
+      "cache_read": 0.0
+    }
+  }
+}

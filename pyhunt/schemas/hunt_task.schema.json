@@ -26,8 +26,8 @@
     "priority": { "type": "integer", "minimum": 1, "maximum": 5 },
     "source": {
       "type": "string",
-      "enum": ["recon", "gapfill", "feedback", "reconcile", "taint", "sink_backward", "specialist", "catchall"],
-      "description": "Which stage produced this task. 'reconcile' = F1 completeness re-queue; 'taint' = deterministic entry→sink chunking (V8); 'sink_backward' = orphan-sink backward audit — a dangerous sink no enumerated input reaches, hunted backward through its callers (F3); 'specialist' = gated repo-wide specialist sweep (V12) — see 'specialist'; 'catchall' = terminal whole-repo coverage sweep (F6) — LOW-priority hunt for an eligible source file no other task covered."
+      "enum": ["recon", "gapfill", "feedback", "reconcile", "taint", "sink_backward", "entry_forward", "specialist", "catchall"],
+      "description": "Which stage produced this task. 'reconcile' = F1 completeness re-queue; 'taint' = deterministic entry→sink chunking (V8); 'sink_backward' = orphan-sink backward audit — a dangerous sink no enumerated input reaches, hunted backward through its callers (F3); 'entry_forward' = one task per enumerated entry point followed forward, queued whether or not a sink was found behind it (W4.3) — sink-backward finds what is reachable FROM a known sink, entry-forward finds sinks the table does not know; 'specialist' = gated repo-wide specialist sweep (V12) — see 'specialist'; 'catchall' = terminal whole-repo coverage sweep (F6) — LOW-priority hunt for an eligible source file no other task covered."
     },
     "specialist": {
       "type": "string",

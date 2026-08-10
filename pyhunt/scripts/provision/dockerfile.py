@@ -176,7 +176,34 @@ ECOSYSTEM_TEMPLATES: dict[str, dict] = {
         "base": "python:{ver}-slim",
         "default_ver": "3.11",
         "ver_key": "python",
-        "install": "RUN pip install poetry && poetry install --no-root || true",
+        # Three faults lived in the previous one-liner
+        # (`RUN pip install poetry && poetry install --no-root || true`), and
+        # together they made Proof mode structurally unreachable for every
+        # Poetry-managed Python target:
+        #
+        # 1. Poetry creates its OWN virtualenv by default, so every dependency
+        #    landed in ~/.cache/pypoetry/virtualenvs/... — a directory the
+        #    PoC's `python3` never looks in. The image looked provisioned and
+        #    could not import the target.
+        # 2. `--no-root` skips installing the target package itself, which is
+        #    the one package a PoC must be able to import.
+        # 3. `|| true` swallowed the failure, so `sandbox.py up` reported
+        #    `provisioning_status: "built"` on a total miss. phase0_preflight.md
+        #    §4 promises that degraded provisioning "is recorded and carried
+        #    into every finding as an environment fact" — `|| true` guaranteed
+        #    that promise could never be kept.
+        #
+        # The pip fallback stays deliberately un-swallowed: if neither path can
+        # install the target, the BUILD must fail so provisioning reports it,
+        # rather than handing replay an image that can only prove hello-world.
+        "install": (
+            "ENV POETRY_VIRTUALENVS_CREATE=false \\\n"
+            "    POETRY_NO_INTERACTION=1 \\\n"
+            "    PIP_DISABLE_PIP_VERSION_CHECK=1\n"
+            "RUN pip install --no-cache-dir poetry \\\n"
+            " && (poetry install --no-interaction \\\n"
+            "     || pip install --no-cache-dir -e .)"
+        ),
         "build": "python -c \"import sys; print(sys.version)\"",
         "test": "poetry run pytest -q || true",
         "deps": _PIP_DEPS_PROBE,

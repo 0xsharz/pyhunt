@@ -451,9 +451,43 @@ When SKILL.md is re-invoked against an existing results directory whose
 
 ---
 
+## Step 8 — Fingerprint the target, so "we never modified it" is checkable
+
+```bash
+python3 "${PYHUNT_DIR}/scripts/repo_guard.py" snapshot \
+  --repo "${TARGET}" --results-dir "${RESULTS_DIR}"
+```
+
+`SKILL.md` §5 says PyHunt never modifies the target repository, "not even to add
+a test", and `phase2_shared.md` repeats it to every hunt agent. Nothing checked
+it. On a real run the graph extractor wrote a `graphify-out/` directory into the
+target from phase 1b onward; every hunt agent afterwards saw the untracked
+directory and reported that it "was already there" — true from each agent's
+point of view, false about the run. The measurement was of a tree PyHunt had
+modified, and the report said otherwise.
+
+The snapshot is a `git status --porcelain --untracked-files=all` fingerprint
+(or, for a non-git target, a path+size manifest — a guard that silently passes
+on targets it cannot check is the same defect one level down). Re-assert it at
+the end of every phase that runs a tool against the target:
+
+```bash
+python3 "${PYHUNT_DIR}/scripts/repo_guard.py" assert \
+  --repo "${TARGET}" --results-dir "${RESULTS_DIR}" --phase phase1b_taint
+```
+
+Exit 2 is a stop, not a hint. A run that has modified its target has invalidated
+its own baseline, and the honest response is to find what wrote there and say so
+**before** writing a report, not after.
+
+---
+
 ## Gate to Phase 1
 
 Proceed only when all of these hold:
+
+- [ ] `repo_guard.py snapshot` wrote `repo_guard.json`, so the "target
+      unmodified" claim is checkable rather than asserted
 
 - [ ] `preflight.json` exists, is non-empty, and parses as JSON
 - [ ] it carries a `language_census` block and a `gate` object — **checked by

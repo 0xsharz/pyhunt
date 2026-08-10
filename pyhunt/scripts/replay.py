@@ -1585,6 +1585,11 @@ class ProofRecord:
     #: Empty in a normal run. Non-empty is not an error — it is the audit trail
     #: for a promotion that was refused rather than lost.
     promotion_blocked: list[str] = field(default_factory=list)
+    #: Whether the PoC's own source carries this run's nonce or canary path.
+    #: ``False`` means condition 3 was unsatisfiable from the payload side, so
+    #: an unproven outcome from this run says nothing about the target — see
+    #: :func:`replay_finding`. ``None`` when there was no PoC to inspect.
+    nonce_in_poc: bool | None = None
     runs: list[ReplayRun] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     generated_at: str = field(
@@ -1641,6 +1646,7 @@ class ProofRecord:
             "nonce": self.nonce,
             "nonce_key": self.nonce_key,
             "nonce_key_source": self.nonce_key_source,
+            "nonce_in_poc": self.nonce_in_poc,
             "run_secret_source": self.run_secret_source,
             "vuln_class": self.vuln_class,
             "image": self.image,
@@ -1773,6 +1779,30 @@ def replay_finding(
     if secret is None:
         _persist_minted_secret(results_dir)
 
+    # D-15. A PoC whose source contains neither this run's nonce nor its canary
+    # path cannot satisfy gate condition 3, and it is knowable here — before a
+    # container starts — by looking at the text. The reason this is worth a
+    # first-class field rather than a shrug: the outcome it produces is
+    # `sink_reached_unproven`, which is *also* what a working defence produces.
+    # Without this flag the report cannot tell "the target defended itself" from
+    # "the payload forgot to carry the nonce", and a real code execution has
+    # already been lost to exactly that ambiguity.
+    nonce_in_poc: bool | None = None
+    if artifact is not None:
+        nonce_in_poc = (nonce in artifact.code) or (canary_path(nonce) in artifact.code)
+        if not nonce_in_poc:
+            notes.append(
+                f"the PoC's source contains neither the nonce ({nonce}) nor its "
+                f"canary path ({canary_path(nonce)}), so gate condition 3 cannot "
+                "be satisfied from the payload side no matter what the target "
+                "does. Any `sink_reached_unproven` from this run is therefore "
+                "uninformative about the target's defences. Note that reading "
+                "PYHUNT_NONCE from os.environ inside a PoC always yields None — "
+                "the audit hook deletes it before PoC code runs — so a PoC "
+                "written that way silently falls back to whatever literal it "
+                "was given."
+            )
+
     tier, tier_source = resolve_isolation_tier(manifest, isolation_tier)
     image_ref, image_source = resolve_image(manifest, image)
     roots = _target_roots(manifest, extra_target_roots)
@@ -1789,7 +1819,7 @@ def replay_finding(
             isolation_tier_source=tier_source, container_flags_source=flags_source,
             target_roots=roots, canary_path=canary_path(nonce),
             finding_file=ref.file, promotion_blocked=list(blockers),
-            runs=list(runs), notes=list(notes),
+            runs=list(runs), notes=list(notes), nonce_in_poc=nonce_in_poc,
         )
 
     # 1. Classes execution cannot settle. Checked here rather than inside the

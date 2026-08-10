@@ -76,6 +76,49 @@ _DESER_PY_RX = re.compile(
     r"importlib\.import_module)\b",
 )
 
+# AUTHORED. Both regexes above ask "does this repo reconstruct an object graph
+# from bytes the way pickle does". That is one deserialisation family, and the
+# tables knew only it — so on `dataclasses-avroschema`, a library whose entire
+# documented purpose is turning avro payloads into Python objects, the gate
+# reported "no JVM-style or Python-style deserializer in source" and switched
+# the lens OFF.
+#
+# What it was blind to is SCHEMA-DRIVEN BINARY deserialisation: avro, msgpack,
+# protobuf, thrift, CBOR, BSON, and the dict→dataclass mappers (dacite,
+# pydantic's parse/validate, marshmallow, cattrs, attrs) that usually sit
+# behind them. The bug class is different from pickle's — there is no gadget
+# chain, because the format cannot name a callable — but it is not smaller:
+# schema-controlled recursion depth, unbounded field counts, union resolution
+# by attacker-chosen name, and precision/size fields that drive allocation are
+# all reachable from bytes.
+#
+# The class file needs to know this too: `phase2_class_deser.md` says plainly
+# that the pickle-shaped questions ("what can the payload import?") do not
+# transfer, and gives the schema-driven questions instead.
+_DESER_SCHEMA_RX = re.compile(
+    r"\b(?:fastavro|avro_schema|schemaless_reader|schemaless_writer|"
+    r"msgpack\.(?:unpack|loads?)b?|msgpack\.Unpacker|cbor2?\.loads?|"
+    r"bson\.(?:loads|BSON|decode)|ParseFromString|MessageToDict|"
+    r"thrift|TBinaryProtocol|"
+    r"dacite\.from_dict|from_dict\s*\(|"
+    r"parse_obj\s*\(|parse_raw\s*\(|model_validate(?:_json)?\s*\(|"
+    r"marshmallow|cattrs|structure\s*\(|"
+    r"avro\.(?:io|schema)|DatumReader|BinaryDecoder)\b",
+)
+
+# AUTHORED — resource-exhaustion surface. The lens that would have caught the
+# `.fake()` misses: a size/precision/depth field read out of untrusted input and
+# handed to something that allocates or recurses. Deliberately broad; the cost
+# of over-firing is one sweep.
+_RESOURCE_RX = re.compile(
+    r"\b(?:max_digits|precision|scale|size|length|count|depth|limit|repeat|"
+    r"n_items|num_\w+)\b\s*(?:=|:)|"
+    r"\brange\s*\(\s*(?:\w+\[[^\]]+\]|\w+\.\w+|int\s*\()|"
+    r"\b(?:os\.urandom|secrets\.token_bytes|bytes|bytearray|\[\s*0\s*\]\s*\*)\s*\(?\s*\w+|"
+    r"\brecursion|\bsetrecursionlimit|\bwhile\s+True\b",
+    re.IGNORECASE,
+)
+
 _BATCH_ETL_RX = re.compile(
     r"\b(struct\.(?:un)?pack|codecs\.(?:encode|decode)\([^)]*ebcdic"
     r"|cp037|cp1047|COMP-3|packed[_-]?decimal|RECFM|LRECL"
@@ -131,6 +174,43 @@ _MARKUP_TEMPLATE_RX = re.compile(
 _CODE_EMITTER_RX = re.compile(
     r"\bast\.unparse\s*\(|\bastor\.to_source\s*\(|\bblack\.format_str\s*\(|"
     r"\bisort\.code\s*\(|\bautopep8\.fix_code\s*\(",
+)
+
+# Fourth route, and the one this gate was missing. A generator with no template
+# FILES and no formatter at all: the templates are `string.Template` (or %-format,
+# or f-string) constants living inside an ordinary `.py` module.
+#
+# This is not hypothetical. Measured on dataclasses-avroschema 0.70.2, whose
+# `model_generator/lang/python/templates.py` holds
+#
+#     CLASS_TEMPLATE = """
+#     $decorator
+#     class $name($base_class):$docstring
+#         $fields
+#     """
+#     METACLASS_SCHEMA_FIELD = '$name = """$schema"""'
+#
+# and whose `base.py` reads `self.schema.get("doc")` straight into them. Both
+# halves of the gate are plainly satisfied and the gate fired OFF, because
+# route 1 found no `*.jinja` files and route 3 found no formatter. Thirty
+# distinct codegen-injection sites were then found by other lenses reaching the
+# same files by accident. A repo with a weaker call graph would have lost them.
+#
+# The signature is precise rather than "the file mentions Template": a source
+# line that opens a def/class/import/decorator AND carries a substitution
+# placeholder is code being assembled, and essentially nothing else looks like
+# that.
+_CODE_STRING_TEMPLATE_RX = re.compile(
+    r"(?m)^[ \t]*(?:class|def|async\s+def|import|from|@)\s+[^\n]*"
+    r"(?:\$\{?\w+|\{\w*\}|%\(\w+\)s|%s)",
+)
+
+#: The substitution machinery, checked in the same file as the code-shaped
+#: template above. Present without it, a repo that merely uses `%s` in a log
+#: message would match.
+_TEMPLATE_ENGINE_RX = re.compile(
+    r"\bstring\.Template\s*\(|\bTemplate\s*\(|\.safe_substitute\s*\(|"
+    r"\.substitute\s*\(|\.format_map\s*\(",
 )
 
 # Free-text schema fields — the untrusted text that lands in the emitted
@@ -215,9 +295,10 @@ def _has_batch_surface(recon: dict | None, repo_root: Path, source: list[str]) -
 
 def _emits_source_code(repo_root: Path, files: list[str]) -> bool:
     """True if this repo EMITS SOURCE CODE (as opposed to HTML, JSON, or a
-    chart). Three independent proofs, any one suffices: a template named for
-    the code extension it produces; a template whose body IS source code; or
-    Python that unparses/formats generated source.
+    chart). Four independent proofs, any one suffices: a template named for
+    the code extension it produces; a template whose body IS source code;
+    Python that unparses/formats generated source; or a `.py` module holding
+    code-shaped string templates and the machinery to substitute into them.
 
     Deliberately NOT proof: `.write_text(`, `open(..., "w")`, importing
     jinja2, or the word "generator". Every one of those is ubiquitous in
@@ -236,7 +317,30 @@ def _emits_source_code(repo_root: Path, files: list[str]) -> bool:
             continue  # renders a web page, not a source file
         if _EMITS_CODE_RX.search(body):
             return True
-    return _scan_any(repo_root, files, _CODE_EMITTER_RX)
+    if _scan_any(repo_root, files, _CODE_EMITTER_RX):
+        return True
+    return _has_inline_code_templates(repo_root, files)
+
+
+def _has_inline_code_templates(repo_root: Path, files: list[str]) -> bool:
+    """A `.py` module that both defines a code-shaped template and substitutes.
+
+    Both signals must appear in the SAME file. Checking them repo-wide would
+    fire on any project that has a `%s` in a log line and a `.format()`
+    somewhere else, which is every project.
+    """
+    for rel in files:
+        if not rel.endswith(".py"):
+            continue
+        try:
+            body = (repo_root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _MARKUP_TEMPLATE_RX.search(body):
+            continue
+        if _CODE_STRING_TEMPLATE_RX.search(body) and _TEMPLATE_ENGINE_RX.search(body):
+            return True
+    return False
 
 
 def _has_codegen_surface(repo_root: Path, files: list[str]) -> bool:
@@ -284,10 +388,12 @@ def active_specialists(
         "logic-bug": lambda: True,
         "access-control": lambda: _has_authz_surface(recon, inputs),
         "deserialization": lambda: (_scan_any(repo_root, source_files, _DESER_RX)
-                                    or _scan_any(repo_root, source_files, _DESER_PY_RX)),
+                                    or _scan_any(repo_root, source_files, _DESER_PY_RX)
+                                    or _scan_any(repo_root, source_files, _DESER_SCHEMA_RX)),
         "batch-etl": lambda: _has_batch_surface(recon, repo_root, source_files),
         "iac": lambda: any(is_iac_file(f) for f in source_files),
         "codegen": lambda: _has_codegen_surface(repo_root, source_files),
+        "resource": lambda: _scan_any(repo_root, source_files, _RESOURCE_RX),
     }
     kept: list[str] = []
     for name in SPECIALIST_HINTS:  # default enabled = every known specialist
@@ -311,6 +417,7 @@ _ATTACK_CLASS: dict[str, str] = {
     "batch-etl": "improper_input_handling",
     "iac": "security_misconfiguration",
     "codegen": "codegen_injection",
+    "resource": "resource_exhaustion",
 }
 
 _FOCUS: dict[str, str] = {
@@ -323,6 +430,10 @@ _FOCUS: dict[str, str] = {
     "codegen": (
         "Unescaped untrusted schema text written into the source code this "
         "tool generates — docstring/comment terminator breakout (CWE-94)"
+    ),
+    "resource": (
+        "Attacker-chosen size, depth, precision and count fields driving "
+        "unbounded allocation, recursion or superlinear work (CWE-400/CWE-770)"
     ),
 }
 
@@ -364,6 +475,18 @@ _LENS_SIGNALS: dict[str, tuple[str, ...]] = {
     "access-control": (
         "auth", "permission", "role", "acl", "policy", "login", "session",
         "tenant", "owner", "admin", "guard", "middleware",
+    ),
+    # `fake`, `factory` and `sample` are in here deliberately. A sweep once
+    # cleared the entire `.fake()` surface of a library with the reasoning
+    # "these methods' entire job is synthetic test data" — correct for the
+    # question that sweep was asking (weak randomness) and wrong for the one it
+    # was not (a schema-supplied `size` driving an unbounded allocation). Two
+    # real findings were lost to that. A file cleared under one lens must still
+    # be visible to the others.
+    "resource": (
+        "field", "type", "parse", "decode", "deserial", "render", "generat",
+        "recurs", "walk", "expand", "resolve", "fake", "factory", "sample",
+        "buffer", "reader", "writer", "stream", "chunk",
     ),
 }
 

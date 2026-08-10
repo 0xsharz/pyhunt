@@ -21,6 +21,66 @@ URL destinations (NAV); whether the caller was allowed to submit the blob (LOG).
 
 ---
 
+## 0. Schema-driven binary formats — a second family, with different questions
+
+Everything below §1 is about the pickle family: bytes that name a callable. There
+is a second family this lens owns and the questions do not transfer.
+
+**Avro, msgpack, protobuf, thrift, CBOR, BSON** — and the dict→object mappers
+that usually sit behind them (`dacite.from_dict`, pydantic's
+`parse_obj`/`model_validate`, marshmallow, cattrs, attrs) — cannot name a
+callable. There is no gadget chain, because the wire format has no field that
+means "import this". A hunter who arrives here with pickle's questions concludes
+"safe" and moves on.
+
+That conclusion has been wrong in a measurable way. The signature table used to
+know pickle, YAML, marshal, dill and torch and nothing else, so on a library
+whose *entire documented purpose* is turning avro payloads into Python objects,
+the gate reported "no JVM-style or Python-style deserializer in source" and
+switched this lens **off**. The two highest-impact runtime defects in that run
+were found by a catch-all sweep three routing hops away.
+
+The questions that do transfer, restated for a schema-driven format:
+
+1. **Who supplies the SCHEMA?** This is the one that matters most and it is easy
+   to miss, because the schema feels like configuration. If the reader accepts a
+   schema from a registry, an HTTP response, an uploaded file, or a field inside
+   the payload itself, then the schema is attacker input — and a schema
+   controls recursion depth, field count, union membership, and every size and
+   precision field the decoder will honour.
+2. **How deep can the structure nest?** Schema→schema and union→union recursion
+   with no depth parameter is the commonest defect in this family. Establish
+   whether the recursion is pure Python (a survivable `RecursionError`) or
+   crosses into a C decoder (a process-killing segfault). If the answer is
+   "unbounded", the finding is real and it belongs to **RES** — file it there
+   via `gaps_observed`, or file it here with `vuln_class:
+   uncontrolled_recursion` if the recursion is inside the deserialiser you are
+   already reading.
+3. **How is a union resolved?** If the branch is chosen by a *name* the payload
+   supplies, an attacker picks which type gets constructed. That is the closest
+   thing this family has to a gadget, and it is worth chasing: a name collision
+   between two records in different namespaces means one caller's type is built
+   from another's bytes.
+4. **What does a MISSING field become?** A required field absent from the
+   payload that silently defaults — to `True`, to an empty list, to the first
+   enum member — is an authentication or authorisation bug wearing a
+   deserialisation costume. Read the mapper's default-handling, not the schema's
+   declaration.
+5. **What does an UNKNOWN field do?** Silently ignored is usually fine; silently
+   *assigned* is mass assignment (LOG's, via `gaps_observed`); rejected is a
+   control worth recording in `design_controls`.
+6. **Does decoding mutate process state?** A precision, a context, a registry, a
+   cache keyed by a payload-supplied name. Those are `state_mutation` and have a
+   real oracle — declare a `structural_probe` of kind `state_mutation`.
+
+Proof for this family is rarely the audit hook: no watched event fires when a
+decoder builds an object. Use the second oracle (`phase2_shared.md` §6.8) —
+`exception_escape` for a crash reachable from attacker bytes, `growth_curve` for
+depth or size, `state_mutation` for a contaminated global — and say plainly in
+`poc.notes` when the honest answer is that only static reasoning is available.
+
+---
+
 ## 1. What the observer can see for your classes
 
 | Sink | Audit event | Notes |

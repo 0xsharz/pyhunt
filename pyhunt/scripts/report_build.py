@@ -57,6 +57,7 @@ import _bootstrap  # noqa: F401  (must precede any third-party import)
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -110,24 +111,11 @@ COMPUTED_TOP_LEVEL_FIELDS = ("summary", "coverage", "input_inventory",
 #: Fallback CWE by vulnerability class, used only when a finding carries no CWE
 #: of its own. Hunters emit one; findings that lost it reached CWE-matching
 #: scorers bare, which reads as "no weakness identified".
-CLASS_CWE = {
-    "code_injection": "CWE-94", "codegen": "CWE-94", "ssti": "CWE-94",
-    "logic_chain": "CWE-94", "codegen_injection": "CWE-94",
-    "docstring_injection": "CWE-94", "template_injection": "CWE-1336",
-    "command_injection": "CWE-78", "ssrf": "CWE-918", "path_traversal": "CWE-22",
-    "zip_slip": "CWE-22", "sql_injection": "CWE-89", "xxe": "CWE-611",
-    "deserialization": "CWE-502", "open_redirect": "CWE-601",
-    # Recon names the pickle/yaml variants separately; unmapped, they reached
-    # CWE-class scorers bare.
-    "deserialization_pickle": "CWE-502", "deserialization_yaml": "CWE-502",
-    "unsafe_reflection": "CWE-470", "eval_injection": "CWE-95",
-    "xss_stored": "CWE-79", "xss_reflected": "CWE-79",
-    "credential_leak": "CWE-200", "information_disclosure": "CWE-200",
-    "infoleak": "CWE-200", "header_injection": "CWE-113",
-    "race_condition": "CWE-362",
-    "uncontrolled_recursion_resource_exhaustion": "CWE-674",
-    "denial_of_service": "CWE-400", "algorithmic_complexity_dos": "CWE-407",
-}
+# The class -> CWE vocabulary lives in `oracle/taxonomy.py`, which is also
+# where the D18 consistency check and the evidence-driven class upgrade
+# live. Two tables that drift apart is how one class ends up with two CWEs
+# depending on which module asked.
+from oracle.taxonomy import CLASS_CWE  # noqa: E402,F401
 
 #: Baseline CVSS 3.1 (score, vector) by severity band. A backfill FLOOR for a
 #: finding that reached the report with no vector of its own — never an
@@ -260,6 +248,43 @@ def _task_outcomes(root: Path) -> dict[str, list[dict]]:
         return {}
 
 
+def _flatten_verifications(records: dict[str, dict]) -> dict[str, dict]:
+    """Accept both shapes a phase 2c record is written in.
+
+    `phases/phase2c_verify.md` specifies an **envelope** — `model`,
+    `hunt_model`, `model_diversity`, `execution_outcome`, `gate_dissent`, and
+    an inner `verdict` object that validates against `validation.schema.json`.
+    Everything in this module was written against the **flat** shape, where
+    `verdict` is the string `confirmed`/`rejected`/`needs_more_info` and
+    `rationale`, `validator_confidence` and `cvss_vector` sit beside it.
+
+    Fed an envelope, `attach_validation` copied a dict into a field the schema
+    types as a string, `select_delivered` compared a dict against `"confirmed"`
+    and delivered nothing, and `attach_coverage` used a dict as a dict key and
+    raised `TypeError: unhashable type: 'dict'`. So the mismatch did not
+    degrade quietly — but it did stop the phase that produces the advisory.
+
+    Flattening here rather than at each of the six call sites keeps one shape
+    downstream. Envelope-only keys are preserved under an `envelope_` prefix so
+    nothing is lost, and a record already flat is returned untouched.
+    """
+    out: dict[str, dict] = {}
+    for finding_id, record in (records or {}).items():
+        if not isinstance(record, dict):
+            continue
+        inner = record.get("verdict")
+        if not isinstance(inner, dict):
+            out[finding_id] = record          # already flat
+            continue
+        merged = dict(inner)
+        for key, value in record.items():
+            if key == "verdict":
+                continue
+            merged.setdefault(f"envelope_{key}" if key in merged else key, value)
+        out[finding_id] = merged
+    return out
+
+
 def load_run(results_dir: str | Path) -> dict:
     """Everything the report is built from, read once.
 
@@ -272,7 +297,7 @@ def load_run(results_dir: str | Path) -> dict:
         "results_dir": str(root),
         "manifest": findings_io.load_manifest(root),
         "findings": findings_io.load_findings(root),
-        "verifications": findings_io.load_verifications(root),
+        "verifications": _flatten_verifications(findings_io.load_verifications(root)),
         "proofs": findings_io.load_proofs(root),
         "inputs": _read_json(root / "inputs.json", {}),
         "coverage": _read_json(root / "coverage.json", {}),
@@ -478,6 +503,216 @@ def attach_cwe(payload: dict, findings_by_id: dict[str, dict]) -> None:
         cwe = stored.get("cwe") or CLASS_CWE.get(entry.get("vuln_class") or "")
         if cwe:
             entry["cwe"] = cwe
+
+
+def attach_structural(payload: dict, findings_by_id: dict[str, dict]) -> None:
+    """Carry each finding's structural verdict onto its report entry.
+
+    Kept in its own key rather than folded into ``validation`` or ``poc``,
+    because a reader scanning one column must not be able to mistake
+    ``demonstrated`` for ``proven``. They are different claims from different
+    oracles and the report says so at every level it appears.
+    """
+    for entry in payload.get("findings", []):
+        stored = findings_by_id.get(entry["finding_id"]) or {}
+        record = stored.get("structural")
+        if isinstance(record, dict) and record.get("outcome"):
+            entry["structural"] = record
+
+
+def _norm_report_path(path: object) -> str:
+    """Repo-relative, forward slashes, no leading `./`. See dedupe._norm_file
+    for why `lstrip("./")` is the wrong tool."""
+    text = str(path or "").replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text.lstrip("/")
+
+
+def attach_reachability(payload: dict, results_dir: Path) -> None:
+    """Stamp each finding with the tier of the file it lives in (W5.2).
+
+    `recon_enumerate.py` already classifies every file as `public_api`,
+    `internal`, `ci`, `build`, `example` or `test`. Joining that onto findings
+    lets a reader sort by reachability **without anything being dropped**,
+    which is the whole disagreement this field settles.
+
+    The recorded run found 44 sites a comparison tool did not, and they were
+    not homogeneous: a `publish.yaml` tag trigger that is real and severe, and
+    several test-harness issues that are real and less urgent. Presenting those
+    as one undifferentiated list invites the reader to discount all of them;
+    dropping the test-tier ones would have discarded the run's **only proven
+    finding**, which lives in `tests/documentation/test_documentation.py`.
+
+    So: sort by it, never filter by it. Absent enumeration leaves the field off
+    entirely rather than guessing a tier from a path.
+    """
+    path = results_dir / "logs" / "recon_enumeration.json"
+    if not path.is_file():
+        return
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    tiers = {
+        str(row.get("path")): row.get("reachable_from")
+        for row in doc.get("files", []) or []
+        if isinstance(row, dict) and row.get("path") and row.get("reachable_from")
+    }
+    if not tiers:
+        return
+
+    counts: dict[str, int] = {}
+    for entry in payload.get("findings", []):
+        file = _norm_report_path(entry.get("file"))
+        tier = tiers.get(file)
+        if not tier:
+            continue
+        entry["reachable_from"] = tier
+        counts[tier] = counts.get(tier, 0) + 1
+    if counts:
+        payload["reachability"] = {
+            "by_tier": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
+            "note": (
+                "The tier of the file each finding lives in, from the phase 1 "
+                "enumeration. Sort by it; do not filter by it. This run's only "
+                "proven finding is in a `test` file."
+            ),
+        }
+
+
+_ADVISORY_SUFFIX_RX = re.compile(
+    r"\s*—\s*and \d+ more site\(s\) of the same cause\s*$")
+
+
+def _retitle_for_site_count(title: object, site_count: int) -> str:
+    """Rewrite an advisory title's "and N more sites" tail to match reality."""
+    base = _ADVISORY_SUFFIX_RX.sub("", str(title or "")).rstrip()
+    if site_count > 1:
+        return f"{base} — and {site_count - 1} more site(s) of the same cause"
+    return base
+
+
+def attach_advisories(payload: dict, results_dir: Path) -> None:
+    """Carry the root-cause advisories onto the report (W5.1).
+
+    ``cluster.py`` writes ``logs/clusters.json``; this copies its entries in
+    and records the reduction. Absent is a normal outcome — an older run, or a
+    run where phase 3 did not reach the clustering step — and the report is
+    simply built without the section rather than failing.
+
+    The advisories are a **view**. ``findings[]`` is unchanged and every
+    advisory names its member ``finding_ids``, so nothing is collapsed away: a
+    reader who wants the eight call sites still gets eight rows with their own
+    ids, verdicts and CVSS. What changes is that a reader who wants to know how
+    many *defects* there are can now read one number instead of doing the
+    clustering themselves, which was the job the tool was leaving to them.
+    """
+    path = results_dir / "logs" / "clusters.json"
+    if not path.is_file():
+        return
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    entries = doc.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return
+
+    delivered = {f.get("finding_id") for f in payload.get("findings", [])}
+    kept = []
+    for advisory in entries:
+        if not isinstance(advisory, dict):
+            continue
+        members = [f for f in advisory.get("finding_ids", []) if f in delivered]
+        if not members:
+            # Every site in this cluster was withheld or rejected downstream.
+            # Reporting the advisory anyway would name findings the report does
+            # not contain.
+            continue
+        locations = [
+            loc for loc in advisory.get("locations", [])
+            if isinstance(loc, dict) and loc.get("finding_id") in delivered
+        ]
+        kept.append({
+            **advisory,
+            "finding_ids": members,
+            "locations": locations,
+            "site_count": len(members),
+            # The title was written against the pre-filter membership. Left
+            # alone it says "and 4 more site(s)" beside a Sites column reading
+            # 1, because sites withheld or rejected downstream are dropped
+            # here. Re-derive the suffix from what actually survived.
+            "title": _retitle_for_site_count(advisory.get("title"), len(members)),
+        })
+
+    if not kept:
+        return
+    payload["advisories"] = kept
+    payload["advisory_summary"] = {
+        "advisories": len(kept),
+        "sites": len(delivered),
+        "sites_per_advisory": round(len(delivered) / len(kept), 3),
+        "settled_advisories": sum(
+            1 for a in kept if a.get("proven") or a.get("demonstrated")),
+        "largest_advisory": max((a["site_count"] for a in kept), default=0),
+        "order_note": doc.get("order_note", ""),
+        "note": (
+            "One entry per root cause, each naming every location it occurs "
+            "at. `findings[]` is unchanged — this is a view over it, not a "
+            "replacement for it."
+        ),
+    }
+
+
+def attach_execution(payload: dict, findings_by_id: dict[str, dict]) -> None:
+    """Carry each finding's **execution-gate outcome** onto its report entry.
+
+    D20. Until this existed, ``report.json``'s finding objects carried
+    ``validation`` — phase 2c's adversarial verdict — and nothing from the gate.
+    The gate's tally was present, but only in aggregate under
+    ``coverage.execution.by_outcome``, so a consumer of ``report.json`` could
+    read that a run had one ``proven`` finding and had **no way to tell which
+    one it was**. Sorting the machine-settled findings to the top, filtering
+    them in CI, or diffing two runs' settlements were all impossible from the
+    document the tool holds out as its output.
+
+    ``outcome`` is the gate's word, unmodified. Nothing here re-judges anything;
+    it is a join, and the aggregate above is still computed from the same
+    source, so the two cannot drift.
+    """
+    for entry in payload.get("findings", []):
+        stored = findings_by_id.get(entry["finding_id"]) or {}
+        outcome = findings_io.execution_outcome(stored)
+        if not outcome:
+            continue
+        block: dict[str, Any] = {"outcome": outcome}
+        proof = stored.get("proof")
+        if isinstance(proof, dict):
+            for key in ("isolation_tier", "unanimous", "repeats"):
+                value = proof.get(key)
+                if value is not None:
+                    block[key] = value
+        entry["execution"] = block
+
+
+def attach_independent_units(payload: dict, findings_by_id: dict[str, dict]) -> None:
+    """Carry the convergence count onto each report entry.
+
+    ``dedupe.py`` records how many independent hunt tasks reached a site without
+    seeing each other's work. That number was being computed and thrown away by
+    the very step that collapsed the duplicates — 21 of 55 sites in one real run
+    were filed by two or more units, which is corroboration a reader should be
+    told about rather than a redundancy to be silently swallowed.
+    """
+    for entry in payload.get("findings", []):
+        stored = findings_by_id.get(entry["finding_id"]) or {}
+        try:
+            units = int(stored.get("independent_units") or 0)
+        except (TypeError, ValueError):
+            continue
+        if units > 1:
+            entry["independent_units"] = units
 
 
 def observer_markers(run_output: str | None) -> list[str]:
@@ -970,7 +1205,93 @@ def execution_summary(findings: list[dict], manifest: dict) -> dict:
         summary["not_provable_by_observer_note"] = NOT_PROVABLE_BY_OBSERVER_NOTE
         summary["not_provable_by_observer_classes"] = dict(sorted(blind_classes.items()))
         summary["not_provable_by_observer_reasons"] = dict(sorted(blind_reasons.items()))
+    summary["structural"] = structural_summary(findings)
     return summary
+
+
+def structural_summary(findings: list[dict]) -> dict:
+    """The second oracle's denominators — kept strictly beside the first, never merged.
+
+    ``demonstrated`` and ``proven`` are different claims and get different
+    numbers. Merging them would be the same dishonesty as merging
+    ``not_applicable`` into "not proven", one layer along: a reader who sees a
+    single "confirmed" column cannot tell a nonce-attributed process spawn in a
+    fresh container from an AST differential over generated source, and those
+    are not equally strong.
+
+    Where this number earns its place is the ``not_provable_by_observer``
+    bucket. On a real run that bucket held 74 of 145 findings, every one of them
+    honest and every one of them useless to a reader: "no execution could settle
+    this" is true and says nothing about whether the defect is real. A
+    ``demonstrated`` count against that same bucket is what turns "we could not
+    check" into "we checked another way, deterministically, and here is what the
+    predicate saw".
+
+    ``refuted`` is reported as loudly as ``demonstrated``. It is a deterministic
+    demonstration that a defence works, it never deletes a finding, and a report
+    that hid it would be publishing findings whose own evidence contradicts them.
+    """
+    by_outcome: dict[str, int] = {}
+    by_kind: dict[str, int] = {}
+    demonstrated_classes: dict[str, int] = {}
+    refuted_ids: list[str] = []
+
+    probed = 0
+    for finding in findings:
+        record = finding.get("structural") or {}
+        outcome = record.get("outcome")
+        if not outcome:
+            continue
+        probed += 1
+        by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
+        kind = record.get("probe_kind") or "unknown"
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        if outcome == "demonstrated":
+            vuln_class = str(finding.get("vuln_class") or "unknown")
+            demonstrated_classes[vuln_class] = demonstrated_classes.get(vuln_class, 0) + 1
+        elif outcome == "refuted":
+            refuted_ids.append(str(finding.get("finding_id")))
+
+    # How many of the findings the audit hook is blind to actually got a second
+    # look. This ratio is the honest measure of whether the structural oracle is
+    # being used, and a report that omitted it would let "0 demonstrated" mean
+    # either "we probed and found nothing" or "we never probed".
+    blind_total = sum(
+        1 for f in findings
+        if vuln_classes.observer_blind_reason(str(f.get("vuln_class") or ""))
+    )
+    blind_probed = sum(
+        1 for f in findings
+        if vuln_classes.observer_blind_reason(str(f.get("vuln_class") or ""))
+        and (f.get("structural") or {}).get("outcome")
+    )
+
+    return {
+        "probed": probed,
+        "unprobed": len(findings) - probed,
+        "demonstrated": by_outcome.get("demonstrated", 0),
+        "refuted": by_outcome.get("refuted", 0),
+        "inconclusive": by_outcome.get("inconclusive", 0),
+        "probe_error": by_outcome.get("probe_error", 0),
+        "probe_absent": by_outcome.get("probe_absent", 0),
+        "not_attempted": by_outcome.get("not_attempted", 0),
+        "by_outcome": dict(sorted(by_outcome.items())),
+        "by_probe_kind": dict(sorted(by_kind.items())),
+        "demonstrated_classes": dict(sorted(demonstrated_classes.items())),
+        "refuted_finding_ids": sorted(refuted_ids),
+        "observer_blind_total": blind_total,
+        "observer_blind_probed": blind_probed,
+        "note": (
+            "A structural probe shows that the "
+            "target's own code turned attacker-controlled text into an "
+            "executable construct — or breached a stated resource bound, or "
+            "mutated shared state — under a benign/hostile differential, "
+            "measured by a harness the hunter did not write. The execution gate "
+            "shows a dangerous operation firing, carrying this PoC's nonce, "
+            "from the target's own frame, with the payload interpreted. Both "
+            "are real; they are not the same claim, and they are never summed."
+        ),
+    }
 
 
 def attach_coverage(payload: dict, run: dict, withheld: list[dict]) -> None:
@@ -1301,6 +1622,11 @@ def build(
 
     attach_cwe(payload, findings_by_id)
     attach_poc_evidence(payload, findings_by_id, run["proofs"])
+    attach_structural(payload, findings_by_id)
+    attach_execution(payload, findings_by_id)
+    attach_independent_units(payload, findings_by_id)
+    attach_reachability(payload, Path(results_dir))
+    attach_advisories(payload, Path(results_dir))
     attach_variants(payload, findings)
     attach_validation(payload, findings_by_id, verifications)
     attach_cvss(payload, verifications, run["inputs"])

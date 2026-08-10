@@ -164,6 +164,86 @@ ones that reached `proven`). If `updated` is 0 and you have proof records, the
 `finding_id`s do not match and something upstream is wrong; stop and say so
 rather than reporting a clean run.
 
+---
+
+## The second oracle — run every declared structural probe
+
+The execution gate is narrow on purpose, and the price of that narrowness is
+visible: on one real run **74 of 145 findings came back `not_applicable`** —
+codegen injections and resource-exhaustion findings that no audit event can
+settle. Every one of those verdicts was accurate and none of them helped a
+reader decide whether the defect was real.
+
+So findings whose class the observer is blind to may carry a `structural_probe`
+(see `phase2_shared.md` §6.8). Run each one **after** the replay loop and
+**before** phase 2c:
+
+```bash
+# One probe per finding that declared one.
+for f in "${RESULTS_DIR}"/findings/*.json; do
+  id=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));
+f=d['findings'][0] if 'findings' in d else d;
+print(f['finding_id'] if f.get('structural_probe') else '')" "$f")
+  [ -n "$id" ] || continue
+  python3 "${PYHUNT_DIR}/scripts/structural.py" run \
+    --results-dir "${RESULTS_DIR}" --finding-id "$id"
+done
+
+python3 "${PYHUNT_DIR}/scripts/findings_io.py" apply-structural \
+  --results-dir "${RESULTS_DIR}"
+```
+
+Same shape as the replay loop, same discipline, and three rules that are not
+negotiable:
+
+1. **`demonstrated` is not `proven`, and `apply-structural` never writes
+   `execution`.** The two verdicts live in separate keys because they are
+   separate claims. `proven` means a dangerous operation fired, carried this
+   PoC's nonce, came from the target's own frame, and was interpreted.
+   `demonstrated` means a deterministic predicate over the target's own output
+   held under a benign/hostile differential. Both are real. Summing them would
+   be the same dishonesty as folding `not_applicable` into "not proven".
+2. **`refuted` is a result, not a failure — and it never deletes a finding.** A
+   probe that runs cleanly and shows the attacker's text landing as an inert
+   string constant has demonstrated that the *defence works*. Record it, pass it
+   to phase 2c, and let 2c argue. Nothing in an oracle path deletes a finding
+   (`SKILL.md` §9.3), and that includes this one.
+3. **A probe that could not run says nothing.** `probe_error`, `probe_absent`
+   and `inconclusive` are environment and spec facts. They are never evidence
+   about the code, and they never lower a severity.
+
+### One repair attempt, and only one
+
+A probe that comes back `inconclusive` — or `probe_error` for a spec reason
+rather than an environment one — sets `repairable: true` and `repair_hint` in
+`structural/<id>.json`. **Hand that hint back to the hunter for exactly one
+payload revision**, the same shape as §7's schema-repair retry, then re-run.
+
+This is not hypothetical friction. The first real probe written against a live
+generator came back:
+
+> "the attacker's text changed the emitted module enough that it no longer
+> parses (SyntaxError: unexpected indent, line 9). That proves the payload
+> escaped its literal, but not that what it became is executable — a syntax
+> error is a broken generator, not a demonstrated injection. Re-aim the payload
+> at a well-formed statement and re-run."
+
+The renderer re-indents continuation lines; the payload carried its own four
+spaces and landed at eight. One edit — remove the payload's leading spaces — and
+the same probe returned `demonstrated`, 2/2 unanimous. Without the loop, every
+finding whose payload needs that kind of adjustment is a demonstration silently
+lost to whitespace.
+
+**One retry, not a loop with no floor.** Two failures means the probe is aimed
+at the wrong call site, and a human should look at it rather than a model
+guessing again. Record the attempt either way, so the retry rate is visible.
+
+The harness (`observers/pyhunt_structural_probe.py`) is PyHunt's, not the
+hunter's: the hunter declared inputs, the harness supplies the assertion and
+signs its result with the same per-container key the audit hook uses. A spec
+carrying an unknown key is refused with exit 2 rather than ignored — an ignored
+key is how a code-carrying field gets reintroduced.
+
 ## Three of three, unanimous, or no promotion
 
 `replay.py` runs the PoC **three times** and promotes only on unanimity. Two

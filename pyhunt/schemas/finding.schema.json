@@ -6,7 +6,8 @@
   "required": [
     "task_id",
     "findings",
-    "gaps_observed"
+    "gaps_observed",
+    "files_read"
   ],
   "additionalProperties": false,
   "properties": {
@@ -173,6 +174,259 @@
                 "type": "boolean"
               }
             }
+          },
+          "task_id": {
+            "type": "string",
+            "description": "The hunt task that produced this finding. Injected by findings_io.record_finding and preserved by apply-proofs / apply-structural: coverage.py attributes findings to tasks through it, and the payload nonce is derived from (run_id, task_id), so a finding that loses it becomes unreplayable and uncountable."
+          },
+          "structural_probe": {
+            "type": "object",
+            "description": "A DECLARATIVE probe for a class the audit hook cannot see (codegen injection, algorithmic complexity, shared-state contamination, unhandled crashes, and \u2014 via `flow_witness` \u2014 every class CPython raises no audit event for at all: SQL injection, XSS, open redirect, SSTI, log and header injection). Data only: a dotted callable, a benign input, a hostile input. There is deliberately nowhere here to put code \u2014 PyHunt's own harness supplies the assertion, which is what makes a structural verdict worth more than a PoC that grades its own homework. Run `python3 scripts/structural.py kinds` for the vocabulary.",
+            "required": [
+              "kind",
+              "target"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "codegen_ast",
+                  "growth_curve",
+                  "state_mutation",
+                  "exception_escape",
+                  "flow_witness",
+                  "sink_semantics",
+                  "differential_response",
+                  "type_selection",
+                  "config_assertion"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+$",
+                "description": "Dotted import path of the callable under test. It MUST resolve inside the target \u2014 a callable outside the target roots fails condition S-2 and the probe is discarded."
+              },
+              "construct": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+$",
+                "description": "Optional class to instantiate before calling `target`'s final attribute as a method."
+              },
+              "construct_args": {
+                "type": "array"
+              },
+              "construct_kwargs": {
+                "type": "object"
+              },
+              "benign_args": {
+                "type": "array",
+                "description": "Positional arguments for the CONTROL run. Place the literal $PYHUNT_BENIGN where the untrusted value goes; the harness mints that marker itself so the control cannot be chosen to collide with the payload."
+              },
+              "benign_kwargs": {
+                "type": "object"
+              },
+              "hostile_args": {
+                "type": "array",
+                "description": "Positional arguments for the ATTACK run. Place the literal $PYHUNT_NONCE inside the payload; the harness substitutes this run's nonce. For kind=codegen_ast this is mandatory \u2014 the claim is that *this* string became code."
+              },
+              "hostile_kwargs": {
+                "type": "object"
+              },
+              "attribute": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+$",
+                "description": "kind=state_mutation: dotted path of the module global being contaminated."
+              },
+              "expected_value": {
+                "description": "kind=state_mutation: the value the attacker's input should install."
+              },
+              "expected_exceptions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "kind=exception_escape: exception type names that count as an escaping crash."
+              },
+              "input_builder": {
+                "type": "object",
+                "description": "kind=growth_curve: a size-parameterised input from the closed builder vocabulary (repeat_str, list_of, nested_list, nested_dict, repeat_key, json_text).",
+                "required": [
+                  "kind"
+                ]
+              },
+              "sizes": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "minItems": 3,
+                "description": "kind=growth_curve: ascending ladder, at least three rungs \u2014 two points are a line, and a line is not a curve."
+              },
+              "benign_size": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "ratio_threshold": {
+                "type": "number"
+              },
+              "memory_limit_mb": {
+                "type": "integer"
+              },
+              "cpu_limit_s": {
+                "type": "integer"
+              },
+              "wall_limit_s": {
+                "type": "integer"
+              },
+              "extra_args": {
+                "type": "array"
+              },
+              "kwargs": {
+                "type": "object"
+              },
+              "payload_first": {
+                "type": "boolean"
+              },
+              "rationale": {
+                "type": "string",
+                "description": "One sentence: why this differential is the right measurement for this defect."
+              },
+              "entry_args": {
+                "type": "array",
+                "description": "flow_witness: positional arguments for the PUBLIC ENTRY POINT. Must contain `$PYHUNT_NONCE` somewhere \u2014 the sentinel is the whole mechanism; without it the tracer cannot tell the attacker's value from any other string the target is holding."
+              },
+              "entry_kwargs": {
+                "type": "object",
+                "description": "flow_witness: keyword arguments for the entry point. `$PYHUNT_NONCE` may live here instead of in entry_args."
+              },
+              "sink_location": {
+                "type": "string",
+                "pattern": "^[^:]+:[0-9]+$",
+                "description": "flow_witness: the claimed sink as `file:line`, exact. The verdict is the claim that the sentinel is live in THAT frame at THAT line, so an approximate location makes the result meaningless."
+              },
+              "intercept": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+$",
+                "description": "sink_semantics: dotted path to the DANGEROUS CALLABLE to intercept (sqlite3.Cursor.execute, builtins.open, requests.get). The harness wraps it so it captures its arguments and raises \u2014 the operation is never performed."
+              },
+              "argument": {
+                "type": [
+                  "integer",
+                  "string"
+                ],
+                "description": "sink_semantics: which argument of the intercepted callable carries the payload \u2014 a positional index or a keyword name."
+              },
+              "semantics": {
+                "type": "string",
+                "enum": [
+                  "sql",
+                  "path",
+                  "url",
+                  "shell",
+                  "html",
+                  "format"
+                ],
+                "description": "sink_semantics: which grammar decides whether the payload arrived as STRUCTURE or as data."
+              },
+              "root": {
+                "type": "string",
+                "description": "sink_semantics, `path` analyser only: the directory the path was supposed to stay inside."
+              },
+              "privileged_args": {
+                "type": "array",
+                "description": "differential_response: arguments for the PRIVILEGED principal \u2014 the call that legitimately sees the sentinel."
+              },
+              "privileged_kwargs": {
+                "type": "object",
+                "description": "differential_response: keyword arguments for the privileged principal."
+              },
+              "unprivileged_args": {
+                "type": "array",
+                "description": "differential_response: arguments for the principal that should NOT see it."
+              },
+              "unprivileged_kwargs": {
+                "type": "object",
+                "description": "differential_response: keyword arguments for the unprivileged principal."
+              },
+              "sentinel": {
+                "type": "string",
+                "description": "differential_response: the value only the privileged caller should receive. Defaults to the run nonce."
+              },
+              "expected_type": {
+                "type": "string",
+                "description": "type_selection: the fully-qualified type the caller asked for, as `module.QualName`. Anything else coming back is the finding."
+              },
+              "file": {
+                "type": "string",
+                "description": "config_assertion: repo-relative path to the configuration or workflow file. Absolute paths and `..` are refused."
+              },
+              "path": {
+                "type": "string",
+                "description": "config_assertion: dotted/indexed path into the parsed document, e.g. `jobs.release.environment`."
+              },
+              "assertion": {
+                "type": "string",
+                "enum": [
+                  "key_absent",
+                  "key_present",
+                  "value_equals",
+                  "value_matches",
+                  "value_not_matches"
+                ],
+                "description": "config_assertion: the single check to evaluate. Closed vocabulary \u2014 a spec cannot express 'run this predicate'."
+              },
+              "expected": {
+                "description": "config_assertion: the value or regex the assertion compares against."
+              }
+            }
+          },
+          "structural": {
+            "type": "object",
+            "description": "COMPUTED BY PYHUNT \u2014 never emit this field. The structural oracle's verdict, attached by findings_io apply-structural. `demonstrated` is NOT `proven`: report_build counts them under separate denominators, and only the execution gate can promote.",
+            "readOnly": true,
+            "additionalProperties": true,
+            "properties": {
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "demonstrated",
+                  "refuted",
+                  "inconclusive",
+                  "probe_error",
+                  "probe_absent",
+                  "not_attempted"
+                ]
+              },
+              "demonstrated": {
+                "type": "boolean"
+              },
+              "refuted": {
+                "type": "boolean",
+                "description": "A deterministic demonstration that the defence works. Never deletes the finding; phase 2c must address it in writing."
+              },
+              "probe_kind": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              },
+              "conditions": {
+                "type": "object"
+              },
+              "measurements": {
+                "type": "object"
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -199,6 +453,13 @@
           }
         }
       }
+    },
+    "files_read": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Repo-relative paths this unit ACTUALLY opened, one entry per file. W4.2: the coverage ledger is input-level, so a task naming five files could be answered by an agent that opened two and nothing downstream could tell. Phase 3 asserts every task's target_files appear here. Report what you opened, not what you were assigned \u2014 an honest short list is a gap with a name, an inflated one is a false coverage claim."
     }
   }
 }

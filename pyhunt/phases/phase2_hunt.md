@@ -70,15 +70,47 @@ in `schemas/hunt_task.schema.json`.
 | **INJ** | `phase2_class_inj.md` | `command_injection`, `sql_injection`, `code_injection`, `ssti`, `codegen_injection`, `log_injection`, `xss_stored`, `xss_reflected` |
 | **NAV** | `phase2_class_nav.md` | `path_traversal`, `ssrf`, `open_redirect`, `xxe`, `zip_slip`, `improper_input_handling` |
 | **DESER** | `phase2_class_deser.md` | `deserialization`, `unsafe_reflection`, `prototype_pollution` |
-| **LOG** | `phase2_class_log.md` | `auth_bypass`, `idor`, `access_control`, `authorization`, `missing_auth`, `privilege_escalation`, `business_logic`, `logic_error`, `mass_assignment`, `csrf`, `rate_limit`, `weak_crypto`, `cryptographic_failure`, `hardcoded_secret`, `information_disclosure`, `insecure_design`, `security_misconfiguration`, `race_condition`, `regex_dos`, `integer_overflow` |
+| **RES** | `phase2_class_res.md` | `resource_exhaustion`, `denial_of_service`, `dos`, `algorithmic_complexity`, `regex_dos`, `redos`, `uncontrolled_recursion`, `memory_exhaustion`, `unbounded_allocation`, `integer_overflow` |
+| **LOG** | `phase2_class_log.md` | `auth_bypass`, `idor`, `access_control`, `authorization`, `missing_auth`, `privilege_escalation`, `business_logic`, `logic_error`, `mass_assignment`, `csrf`, `rate_limit`, `weak_crypto`, `cryptographic_failure`, `hardcoded_secret`, `information_disclosure`, `insecure_design`, `insecure_default`, `security_misconfiguration`, `supply_chain`, `state_mutation`, `global_state_pollution`, `validation_bypass`, `race_condition` |
+
+Three of those rows moved and it is worth knowing why. `regex_dos` and
+`integer_overflow` used to sit in LOG, which is the file for *"execution cannot
+settle this"* — but a ReDoS and an unbounded allocation are settleable, by
+measurement, and putting them in LOG told the hunter the opposite. `race_condition`
+stays in LOG because whether an interleaving is *allowed* is still a policy
+question, even though `state_mutation` next to it is measurable.
 
 **Unknown `attack_class`.** Route it by the sink family its `scope_hint` names:
 a shell/SQL/template/eval sink → INJ; a path, URL or XML parser → NAV; anything
-that reconstructs objects or resolves names from strings → DESER. If the hint
-still does not settle it, route to **LOG** and set the unit's `routing` field to
-`"fallback"` in the ledger. **Never drop a task for being unroutable** — an
-unroutable task is a fact about the routing table, and it belongs in the ledger
-where the next maintainer can see it.
+that reconstructs objects or resolves names from strings → DESER; anything whose
+harm is *how much* rather than *what* — a size, a depth, a count, a loop bound →
+RES. If the hint still does not settle it, route to **LOG** and set the unit's
+`routing` field to `"fallback"` in the ledger. **Never drop a task for being
+unroutable** — an unroutable task is a fact about the routing table, and it
+belongs in the ledger where the next maintainer can see it.
+
+> **Check this table against the generators before you dispatch.** The sweep and
+> the reconciler mint classes this table has been behind on before: one real run
+> had to invent routings for `injection`, `untrusted_code_execution`,
+> `resource_exhaustion`, `validation_bypass`, `supply_chain`, `state_mutation`
+> and `global_state_pollution` mid-flight, because they were emitted by phase 3
+> and absent here. The table above now covers all seven. A one-line check that
+> the run's own tasks are all routable, before any agent is dispatched:
+>
+> ```bash
+> "${SKILL_DIR}/.venv/bin/python" - <<'PY'
+> import json, sys
+> known = set()  # paste the union of the table's class values
+> tasks = json.load(open(f"{RESULTS_DIR}/tasks.json"))
+> tasks = tasks.get("tasks", tasks)
+> unknown = sorted({t["attack_class"] for t in tasks} - known)
+> print("unroutable:", unknown or "none")
+> PY
+> ```
+>
+> Anything printed is routed by the fallback rule above **and recorded as
+> `routing: "fallback"`**, so the gap is visible in the ledger rather than
+> silently absorbed.
 
 **LOG is defined by `scripts/oracle/classes.py`.** Every class in
 `UNDECIDABLE_BY_EXECUTION` routes to LOG, because those are exactly the classes
@@ -223,8 +255,31 @@ per unit:
 - `mode`, `isolation_tier`, `execution_available` — from `manifest.json`.
 - `poc_execution` — include only when `execution_available` is `true`. It is the
   per-task recipe from `scripts/poc_runtime.py` (`poc_execution_block`), carrying
-  `nonce` and `canary_path`. **The nonce is minted per task, in Python, and is
-  never shown to the hunter as something to invent or echo back.**
+  `nonce`, `canary_path` and `nonce_transport`. **The nonce is minted per task,
+  in Python, and is never shown to the hunter as something to invent or echo
+  back.**
+
+  Call it with the task's identity, not with a nonce you computed yourself:
+
+  ```python
+  from poc_runtime import poc_execution_block
+  block = poc_execution_block(task_languages, project_env, scratch_dir,
+                              materialize=True,
+                              run_id=RUN_ID, task_id=task["task_id"])
+  ```
+
+  It derives `oracle.nonce.nonce_for(run_id, task_id)` — the same derivation
+  `replay.py` uses, so the two cannot drift — and it **raises** if given neither
+  a nonce nor an identity. It used to return `"nonce": null` when called with
+  nothing and nothing failed; 24 tasks of a real run went out that way, gate
+  condition 3 was unsatisfiable for every one of them, and it was caught only
+  because all six hunt agents noticed unprompted and said so.
+
+  **A unit holds up to 5 tasks and the nonce is per task**, so a single
+  `poc_execution` on the assignment cannot express what the gate requires. Emit
+  `poc_execution_by_task`: a `{task_id: block}` map. Then persist the run secret
+  — `manifest.json:run_secret` and `.run_secret` — before dispatching, or replay
+  will derive different nonces from a fresh secret and match nothing.
 - `scratch_dir` — `{RESULTS_DIR}/logs/hunt/{UNIT_ID}` — and create it before
   dispatching, along with the observer assets when Proof mode is on.
 
@@ -263,13 +318,42 @@ results, skill = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 sys.path.insert(0, str(skill / "scripts"))
 from json_utils import validate_schema
 schema = skill / "schemas" / "finding.schema.json"
+# Reserved names: files this directory holds that are NOT hunt output. The
+# orchestrator's own unit plan once landed here and failed validation loudly,
+# for the entirely correct reason that a plan is not a finding — so the plan
+# moved to logs/hunt_plan.json and the glob learned the convention rather than
+# the next bookkeeping file repeating it.
+RESERVED = {"dispatch.json", "gaps.json", "plan.json", "units.json"}
 for f in sorted((results / "logs" / "hunt").glob("*.json")):
+    if f.name in RESERVED:
+        continue
     docs = json.loads(f.read_text())
     for doc in (docs if isinstance(docs, list) else [docs]):
         errs = validate_schema(doc, schema)
         print(f.name, doc.get("task_id"), errs or "OK")
 PY
 ```
+
+Write the orchestrator's own bookkeeping to `logs/hunt_plan.json` and
+`logs/hunt/dispatch.json`; anything else you invent under `logs/hunt/` must be
+added to `RESERVED` above in the same edit.
+
+**Then check the labels.**
+
+```bash
+python3 "${PYHUNT_DIR}/scripts/findings_io.py" class-check \
+  --results-dir "${RESULTS_DIR}"
+```
+
+Advisory, never fatal — a mislabelled finding is still a real finding. But the
+disagreement has to surface *now*, because by report time it has already
+corrupted three things: `dedupe.py` groups by class family, `oracle/classes.py`
+decides provability by class string, and every CWE-keyed consumer downstream
+reads the label rather than the description.
+
+Measured on a real run: **46 of 145 findings** carried a class that disagreed
+with their own CWE, and the single `proven` remote code execution of the entire
+scan was filed as `improper_input_handling` / CWE-829.
 
 A malformed return gets **one** repair attempt: hand the subagent its own output
 and the validator's error list and ask for a corrected object. If the repair

@@ -16,11 +16,14 @@ graphify`, though the PyPI dist is `graphifyy`). Callers should only see
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -101,6 +104,45 @@ def _save_cache(cache_path: Path, doc: GraphDocument) -> None:
     cache_path.write_text(json.dumps(doc.to_dict(), indent=2), encoding="utf-8")
 
 
+@contextlib.contextmanager
+def _scratch_cwd():
+    """Run the extractor from a throwaway directory, never from the target.
+
+    D-14. ``graphify`` writes a ``graphify-out/`` directory relative to the
+    process's working directory. During a real scan that working directory was
+    the target repository, so ``git status`` inside the target reported
+    ``?? graphify-out/`` from phase 1b onward — and PyHunt claims, twice and in
+    absolute terms, that it never modifies the target ("not even to add a
+    test"). Every hunt agent afterwards saw an untracked directory and
+    defensively reported that it "was already there", which was true from each
+    agent's point of view and false about the run.
+
+    Nothing was corrupted that time. The property is still binary: a scanner
+    that writes into the tree it is measuring cannot claim the measurement was
+    of the unmodified tree, and on a target with a dirty-tree check or a
+    pre-commit hook it would change the target's own behaviour mid-scan.
+
+    Failure to chdir is non-fatal — a graph built from the wrong cwd is worth
+    more than no graph — but it is logged loudly, because the property it
+    protects is one PyHunt states rather than merely prefers.
+    """
+    previous = os.getcwd()
+    scratch = tempfile.mkdtemp(prefix="pyhunt-graph-")
+    try:
+        os.chdir(scratch)
+    except OSError as exc:  # pragma: no cover - defensive
+        log.warning("graph.build: could not chdir to scratch (%s); the extractor "
+                    "may write into the current directory", exc)
+    try:
+        yield Path(scratch)
+    finally:
+        try:
+            os.chdir(previous)
+        except OSError:  # pragma: no cover - defensive
+            pass
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def _try_graphify_build(root: Path, content_hash: str) -> GraphDocument | None:
     """Attempt a graphify AST-only build. Returns None on any failure (REQ-GRA-006)."""
     isolation_violations = check_backend_isolation()
@@ -123,13 +165,21 @@ def _try_graphify_build(root: Path, content_hash: str) -> GraphDocument | None:
     # and pre-filters files it can't or shouldn't extract from (secrets, binaries,
     # unreadable paths). Doing our own rglob() here hands graphify files it will
     # reject and gets us PermissionError on sandbox-blocked entries.
-    try:
-        detected = graphify_detect(root)
-    except Exception as exc:  # pragma: no cover - graphify runtime error
-        log.warning("graph.build: graphify.detect raised %r; falling back.", exc)
-        return None
+    with _scratch_cwd():
+        try:
+            detected = graphify_detect(root)
+        except Exception as exc:  # pragma: no cover - graphify runtime error
+            log.warning("graph.build: graphify.detect raised %r; falling back.", exc)
+            return None
 
-    code_files = [Path(f) for f in (detected.get("files") or {}).get("code", []) or []]
+    # Re-based against the target root before any chdir. A detector that
+    # returned repo-relative paths would otherwise resolve against the scratch
+    # directory below and extract nothing, which reads as "this repo has no
+    # code" rather than as the path bug it is.
+    code_files = [
+        Path(f) if Path(f).is_absolute() else (root / f)
+        for f in (detected.get("files") or {}).get("code", []) or []
+    ]
     if not code_files:
         log.warning(
             "graph.build: graphify.detect found no code files under %s "
@@ -138,26 +188,30 @@ def _try_graphify_build(root: Path, content_hash: str) -> GraphDocument | None:
         )
         return None
 
-    try:
-        raw_nodes = graphify.extract(code_files, parallel=_graphify_parallel())
-    except TypeError:
-        # Older graphify variants without a ``parallel`` kwarg — fall back
-        # to the positional form. Second TypeError layer defends against a
-        # variant that expects a stringified path list.
+    # Every graphify call is made from a throwaway cwd — see _scratch_cwd. The
+    # file list is absolute, so the extractor reads exactly the same files; the
+    # only thing that moves is where it writes its own output.
+    with _scratch_cwd():
         try:
-            raw_nodes = graphify.extract(code_files)
+            raw_nodes = graphify.extract(code_files, parallel=_graphify_parallel())
         except TypeError:
+            # Older graphify variants without a ``parallel`` kwarg — fall back
+            # to the positional form. Second TypeError layer defends against a
+            # variant that expects a stringified path list.
             try:
-                raw_nodes = graphify.extract([str(p) for p in code_files])
+                raw_nodes = graphify.extract(code_files)
+            except TypeError:
+                try:
+                    raw_nodes = graphify.extract([str(p) for p in code_files])
+                except Exception as exc:  # pragma: no cover - graphify runtime error
+                    log.warning("graph.build: graphify.extract(str-list) raised %r; falling back.", exc)
+                    return None
             except Exception as exc:  # pragma: no cover - graphify runtime error
-                log.warning("graph.build: graphify.extract(str-list) raised %r; falling back.", exc)
+                log.warning("graph.build: graphify.extract raised %r; falling back.", exc)
                 return None
         except Exception as exc:  # pragma: no cover - graphify runtime error
             log.warning("graph.build: graphify.extract raised %r; falling back.", exc)
             return None
-    except Exception as exc:  # pragma: no cover - graphify runtime error
-        log.warning("graph.build: graphify.extract raised %r; falling back.", exc)
-        return None
 
     # Root-relative real paths of the files graphify extracted. graphify may
     # emit node ``source_file`` values relative to a package sub-root it

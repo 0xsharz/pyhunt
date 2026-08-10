@@ -1044,7 +1044,7 @@ def up(repo: Path, results_dir: Path, *, build_image: bool = True,
 # fence is authored after the nonce exists, so the image's contents cannot
 # contain a matching one.
 _VERIFY_SCRIPT = r'''
-import json, os, socket, sys
+import json, os, re, socket, sys
 
 fence = sys.argv[1]
 canaries = [p for p in sys.argv[2].split("|") if p]
@@ -1119,10 +1119,42 @@ record("no_host_filesystem",
 fragments = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE",
              "CREDENTIAL", "AUTH", "SESSION", "COOKIE", "PRIVATE", "SIGNATURE",
              "BEARER", "APIKEY", "ACCESS_ID")
-found = sorted(n for n in os.environ if any(f in n.upper() for f in fragments))
+
+# A name-fragment match is deliberately broad, and that breadth costs one
+# well-known false positive: every official `python:*` image sets
+#
+#     GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305
+#
+# which is the release manager's PUBLIC key fingerprint, used at image build
+# time to verify the CPython source tarball's signature. It is published on
+# python.org. Docker offers no way to unset an image ENV at run time, so
+# without this exemption the assertion fails on every templated Python target
+# and Proof mode becomes unreachable for the language PyHunt exists to scan.
+#
+# The exemption is keyed on the NAME and validated against the VALUE's shape:
+# a 40-hex-character fingerprint and nothing else. An operator credential
+# smuggled in as GPG_KEY would not match, and no other name is exempted. If a
+# future entry here would need a looser pattern than "this is structurally
+# incapable of being a secret", it does not belong in this table.
+_PUBLIC_ENV_EXEMPTIONS = {
+    "GPG_KEY": re.compile(r"\A[0-9A-Fa-f]{40}\Z"),
+}
+
+
+def _is_public_constant(name):
+    pattern = _PUBLIC_ENV_EXEMPTIONS.get(name.upper())
+    return bool(pattern and pattern.match(os.environ.get(name) or ""))
+
+
+found = sorted(n for n in os.environ
+               if any(f in n.upper() for f in fragments)
+               and not _is_public_constant(n))
+exempted = sorted(n for n in os.environ if _is_public_constant(n))
 record("no_auth_env", not found,
-       ("credential-shaped variables present: " + ", ".join(found)) if found
-       else "no credential-shaped variable in the container environment")
+       (("credential-shaped variables present: " + ", ".join(found)) if found
+        else "no credential-shaped variable in the container environment")
+       + (" (exempt, public base-image constants: " + ", ".join(exempted) + ")"
+          if exempted else ""))
 
 # (d) the rootfs really is read-only. Verifies the flag we claim rather than
 # trusting that it was passed.

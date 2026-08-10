@@ -88,6 +88,48 @@ execution cannot answer, and `sink_reached_unproven` may well be a defence doing
 its job. Collapsing them into "not proven" is how a scanner turns a broken
 container into a clean bill of health.
 
+### The second oracle, and why `not_applicable` needed one
+
+The gate above is deliberately narrow, and the price of that narrowness showed
+up the first time PyHunt was measured against a real package: **74 of 145
+findings came back `not_applicable`.** Every verdict accurate. Every one of them
+useless to a reader, because "no execution could settle this" says nothing about
+whether the defect is real. A comparison tool settled all 18 of its findings on
+the same package — by having each PoC assert about its own output, which is the
+self-report this gate exists to remove. Both tools were half right.
+
+So there is a second oracle, `scripts/oracle/structural.py`, for exactly the
+classes the audit hook is blind to: codegen injection, algorithmic complexity
+and unbounded allocation, shared-state contamination, unhandled crashes. It has
+its own five conditions, its own vocabulary, and one non-negotiable property:
+
+> **The hunter declares a probe as data. PyHunt's harness supplies the
+> assertion.**
+
+A hunter writes a JSON spec — a dotted callable inside the target, a benign
+input, a hostile input carrying the run's nonce. It writes no parsing, no
+assertion, no verdict. `observers/pyhunt_structural_probe.py`, shipped with the
+skill and read-only inside the container, calls the target, measures the
+property, signs the result with the same per-container HMAC key, and the oracle
+folds it. There is nowhere in the spec to put code, and an unknown key is
+refused with exit 2 rather than ignored.
+
+Its outcomes are `demonstrated` / `refuted` / `inconclusive` / `probe_error` /
+`probe_absent` / `not_attempted`. Two rules about them:
+
+- **`demonstrated` is not `proven` and never becomes it.** `PROMOTING` in
+  `oracle/gate.py` remains a set of one. `findings_io apply-structural` writes
+  the `structural` key and never touches `execution`, and `report_build` counts
+  them under separate denominators. They are different claims — one is "a
+  dangerous operation fired and the runtime interpreted the payload", the other
+  is "a deterministic predicate over the target's own output held under a
+  differential" — and a reader handed one merged column cannot tell them apart.
+- **`refuted` is the outcome the execution gate has no analogue for, and it is
+  the most valuable thing the second oracle produces.** A differential that runs
+  cleanly and shows the attacker's text landing as an inert string constant has
+  *demonstrated that the defence works*. It still does not delete the finding —
+  nothing in an oracle path does — but phase 2c must argue past it in writing.
+
 **Nothing in the gate path may delete a finding.** A PoC that fails to reproduce
 is a fact about the PoC. A missing dependency is a fact about the environment. A
 silent observer is not a verdict. Findings still die — in phase 2c, which reads
@@ -136,18 +178,19 @@ correctly. Do not improvise the methodology.
 | # | Phase file | Produces | Leans on | Writes |
 |---|---|---|---|---|
 | 0 | `phase0_preflight.md` | Isolation tier, capability report, the mode decision | `sandbox.py`, `preflight.py`, the `provision/` package | `preflight.json`, `manifest.json:isolation_tier` |
-| 1 | `phase1_recon.md` | Every untrusted input enumerated, plus deterministic git-history results | `history.py` | `inputs.json` |
+| 1 | `phase1_recon.md` | Every untrusted input enumerated, plus deterministic git-history results | `recon_enumerate.py`, `history.py` | `inputs.json`, `logs/recon_enumeration.json` |
 | 1b | `phase1b_taint.md` | Call graph, entry→sink paths, narrowly-scoped hunt tasks | `taint.py` (+ the `graph/` package, `partition.py`, `specialists.py`, `catchall.py`) | `tasks.json` |
 | 2 | `phase2_hunt.md` | Dispatch: one attack class, one location, one agent | — (orchestration) | — |
 | 2 | `phase2_shared.md` | Gates every class agent shares. Read first by all of them | — | — |
 | 2 | `phase2_class_inj.md` | Command, SQL, code-eval and template injection | `references/python-sinks.md` | `findings/<id>.json` |
 | 2 | `phase2_class_nav.md` | Path traversal, SSRF, open redirect, XXE | `references/python-sinks.md` | `findings/<id>.json` |
 | 2 | `phase2_class_deser.md` | pickle, YAML, marshal, and their data-science disguises | `references/python-sinks.md` | `findings/<id>.json` |
+| 2 | `phase2_class_res.md` | Resource exhaustion, algorithmic complexity, unbounded allocation, recursion | `oracle/structural.py` | `findings/<id>.json` |
 | 2 | `phase2_class_log.md` | authz, IDOR, business logic — **no execution oracle exists for these** | `oracle/classes.py` | `findings/<id>.json` |
-| 2b | `phase2b_prove.md` | PoC → replay ×3 in a fresh container → gate verdict | `replay.py` (which calls `oracle/gate.py` in-process), `observers/pyhunt_audit_hook.py` | `proof/<id>.json`, `logs/` |
-| 2c | `phase2c_verify.md` | Adversarial disproof on a **different model** | — (no Bash) | `verify/<id>.json` |
-| 3 | `phase3_sweep.md` | Sibling instances of each confirmed root cause; input dispositions; honest denominators | `coverage.py`, `fingerprint.py` | `coverage.json` |
-| 4 | `phase4_report.md` | The advisory | `cvss.py`, `redact.py` | `report.md`, `report.json` |
+| 2b | `phase2b_prove.md` | PoC → replay ×3 in a fresh container → gate verdict; then every declared structural probe | `replay.py` (which calls `oracle/gate.py` in-process), `structural.py`, `observers/` | `proof/<id>.json`, `structural/<id>.json`, `logs/` |
+| 2c | `phase2c_verify.md` | Adversarial disproof on a **different model**, one agent per finding | — (no Bash) | `verify/<id>.json` |
+| 3 | `phase3_sweep.md` | Sibling instances; dismissed surfaces re-queued under other lenses; site-level dedupe; input dispositions | `coverage.py`, `dedupe.py`, `fingerprint.py` | `coverage.json`, `logs/dedupe_groups.json` |
+| 4 | `phase4_report.md` | The advisory, and a one-command reproduction bundle | `cvss.py`, `redact.py`, `repro_bundle.py` | `report.md`, `report.json`, `repro/` |
 
 After each phase completes: verify its artifact exists, then append the phase's
 id to `manifest.json:phases_completed`. That append is what makes the run
@@ -218,7 +261,19 @@ What that means concretely:
   **only inside the container**, only via `replay.py`, and only after
   `sandbox.py verify` has passed.
 - **Writes** go to `PYHUNT_DIR` and the container's scratch. PyHunt never
-  modifies the target repository — not even to add a test.
+  modifies the target repository — not even to add a test. That claim is now
+  *checked* rather than asserted: `scripts/repo_guard.py snapshot` fingerprints
+  the target in phase 0 and `repo_guard.py assert` re-checks it after every
+  phase that runs a tool against it, exiting 2 if anything moved. It is checked
+  because it was once false — the graph extractor wrote `graphify-out/` into the
+  target mid-run, every subsequent hunt agent reported the untracked directory
+  as pre-existing, and nothing caught it.
+- **Hunt agents do not execute target code, on the host or anywhere.** They
+  author PoCs; phase 2b runs them, in the container, three times, under an
+  observer the agent never touches. `phase2_shared.md` §6.3 used to say the
+  opposite and agents reasonably followed it, building virtualenvs and running
+  attacker payloads on the operator's laptop, outside the boundary phase 0 had
+  just verified. The phase file now agrees with this section.
 - **Never point anything at a live host** the user has not explicitly
   authorised. There is no `--target-url`; it was rejected permanently because it
   turns a validator into an attack tool.
@@ -286,6 +341,64 @@ same process that performed the run it is judging. When this document says the
 gate decides, that is what decides. Likewise `taint.py` is the entry point for
 phase 1b, and the call graph it walks lives in the `graph/` package beside it.
 
+The same arrangement holds for the second oracle: `scripts/structural.py` is the
+driver, it imports `oracle/structural.py`'s `judge_structural` in-process, and
+it reuses `replay.py`'s container machinery wholesale rather than building a
+second one that could drift.
+
+These scripts are newer than most of this document and are easy to skip:
+
+| Script | What it does | Why it exists |
+|---|---|---|
+| `structural.py` | runs one finding's declared probe in a fresh container | 74 of 145 findings in a real run were `not_applicable`; this settles that population deterministically |
+| `dedupe.py` | groups findings by site, picks a canonical by evidence, records `independent_units` | 127 rows over 81 sites made the reader do the deduplication, and threw away the convergence signal while doing it |
+| `repro_bundle.py` | writes `repro/run_all.sh` and per-finding evidence | the one column a comparison tool won outright |
+| `repo_guard.py` | fingerprints the target and asserts it never moved | the "we never modify the target" claim was asserted twice and checked nowhere, and was once false |
+| `recon_enumerate.py` | file inventory, extension census, framework detection with graded confidence, entry-point candidates, and the public API surface | phase 1's Read-only envelope could not be supplied, so the agent ran a nested Bash over the most attacker-authored content in the run (D6). Removing the need for the tools is the only fix that holds. |
+| `lens_matrix.py` | turns a dismissal in `gaps_observed` into tasks under every *other* lens | a surface cleared for one class and never re-asked under another cost two real findings |
+| `cost.py` | tokens, wall-clock, container seconds, and cost per settled finding | a scan whose price is unknown cannot be compared to any other scan, or to a human |
+| `cluster.py` | groups same-root-cause **sites** into advisories, each listing every location | `dedupe.py` answers "is this the same line"; a maintainer is asking "is this the same defect". 127 rows over 81 sites, and still eight rows for one templating bug after site dedupe |
+| `sarif_export.py` | `report.json` → SARIF 2.1.0 | a report a person reads once versus a result a pipeline checks every commit |
+
+**Advisories are a view, never a replacement.** `cluster.py` writes
+`logs/clusters.json` and `report_build` copies it into `report.json.advisories`.
+Every site keeps its own id, verdict, CVSS and proof record in `findings[]`, and
+every advisory names the finding ids it covers. Collapsing the underlying rows
+would trade a readability problem for a coverage lie, which is the trade this
+pipeline refuses everywhere else.
+
+They are ordered **machine-settled first, then by severity** — severity is a
+model's claim about impact, `proven` is evidence a container watched the
+dangerous operation fire. Ordering on severity alone buried a real run's single
+proven finding beneath fifteen unproven highs.
+
+**Cost is measured; money is not.** `cost.py mark --phase <name> --event start|end`
+at every phase boundary, then `cost.py measure --transcript <session.jsonl>` at
+phase 4. Tokens and seconds are facts the run observes. **Dollars appear only
+when the operator passes `--rates`** with a table carrying `source` and `as_of`,
+and every figure is stamped with both. No rate card is compiled into PyHunt: a
+price depends on a contract and a date, neither visible from inside a scan, and
+a confident dollar figure derived from a stale hard-coded list is the same kind
+of unfalsifiable claim as an unproven exploit. See
+`config/cost_rates.example.json`.
+
+Two numbers that must not be merged: **full-price tokens** (fresh input, output,
+cache writes) and **cache reads**. On the recorded run cache reads were 98.8% of
+all traffic and the cheapest line on the card, so a single summed total tracks
+the cheapest component and misstates the spend.
+
+**Run `recon_enumerate.py` before dispatching phase 1**, alongside `history.py`:
+
+```bash
+python3 "${SKILL_DIR}/scripts/recon_enumerate.py" enumerate \
+  --repo "${TARGET}" --results-dir "${RESULTS_DIR}"
+python3 "${SKILL_DIR}/scripts/history.py" mine \
+  --repo "${TARGET}" --results-dir "${RESULTS_DIR}"
+```
+
+Both write into `${RESULTS_DIR}/logs/`. The phase 1 agent then needs `Read` and
+nothing else — which is an envelope the harness can actually give it.
+
 Three rules about them:
 
 1. **Exit code 2 is a stop, not a hint.** It means a script detected a violated
@@ -320,20 +433,30 @@ These are rules you enforce, not aspirations.
    dependency, silent observer, unprovable class — each gets its own outcome, and
    each keeps its finding.
 4. **The report states the achieved isolation tier**, and reports **proven /
-   provable / total as three separate denominators.** Never merge them. "18 of
-   25 proven" is misleading when 6 of the 7 unproven are IDORs that no execution
-   could ever settle; "18 of 19 provable, plus 6 not provable by execution" is
-   the same run described honestly.
-5. **A missing toolchain is never a failed exploit.** `not_attempted` is an
+   provable / not-provable-by-this-observer / total as four separate
+   denominators, with the structural oracle's counts in a fifth block beside
+   them.** Never merge any of them. "18 of 25 proven" is misleading when 6 of
+   the 7 unproven are IDORs that no execution could ever settle; "18 of 19
+   provable, plus 6 not provable by execution" is the same run described
+   honestly. And `demonstrated` is never added to `proven`.
+5. **One row per site, and say how many units found it.** `dedupe.py` collapses
+   same-site findings onto one canonical record — a real run shipped 127 rows
+   over 81 sites and made the reader do the deduplication — and keeps
+   `independent_units`, because several agents converging on one line without
+   seeing each other's work is corroboration, not redundancy.
+6. **The run ships a reproduction bundle.** `repro/run_all.sh` re-runs every
+   piece of evidence through PyHunt's own gate. A report whose PoCs are buried
+   inside JSON is a report nobody re-checks.
+7. **A missing toolchain is never a failed exploit.** `not_attempted` is an
    environment fact. Report it as one.
-6. **Follow the data.** Every finding carries a concrete flow from an
+8. **Follow the data.** Every finding carries a concrete flow from an
    attacker-controlled source to a dangerous sink, at `file:line`s that were
    actually read.
-7. **Name the capability, not the mechanism.** "String interpolation into
+9. **Name the capability, not the mechanism.** "String interpolation into
    `cursor.execute`" is a mechanism. "An unauthenticated caller can read every
    row of `users`" is the finding. A vulnerability must harm someone other than
    the attacker.
-8. **Zero findings is a valid outcome.** If every candidate dies in 2c, say so,
+10. **Zero findings is a valid outcome.** If every candidate dies in 2c, say so,
    list the gaps, and stop. Do not soften the criteria to fill the report.
 
 ---

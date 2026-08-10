@@ -68,6 +68,7 @@ from typing import Any, Iterator
 
 from jsonschema import Draft7Validator
 
+from oracle import taxonomy
 from oracle.finding import placeholder_verdict
 from oracle.nonce import nonce_for
 
@@ -339,12 +340,157 @@ def apply_proofs(results_dir: str | Path) -> dict[str, str]:
         if finding is None:
             continue
         before = (finding.get("execution") or {}).get("outcome")
+        before_class = finding.get("vuln_class")
         apply_proof(finding, proof)
+        # D-18. The gate knows what it observed; the label did not. A `proven`
+        # verdict carrying an exec/compile event IS a code execution whatever
+        # the hunter called it, and the run's single proven finding was filed
+        # as `improper_input_handling` for want of this feedback. Only ever
+        # moves a catch-all label toward the evidence, and records the original.
+        upgraded = taxonomy.upgrade_for_evidence(finding, proof)
         after = (finding.get("execution") or {}).get("outcome")
+        if after != before or upgraded:
+            write_finding(results_dir, finding)
+            applied[finding_id] = after or ""
+            if upgraded:
+                print(f"class upgraded on evidence: {finding_id} "
+                      f"{before_class!r} -> {upgraded!r}", file=sys.stderr)
+    return applied
+
+
+def repair_classes(results_dir: str | Path) -> list[dict]:
+    """Replace catch-all classes with the class their own CWE names.
+
+    Recall matters here, not tidiness: nine findings on the recorded run were
+    `improper_input_handling` + CWE-674, which is `uncontrolled_recursion` — a
+    class that routes to the resource lens and is eligible for a `growth_curve`
+    probe. They were outside the second oracle's reach purely because of a
+    label.
+    """
+    changed: list[dict] = []
+    for finding in load_findings(results_dir):
+        before = finding.get("vuln_class")
+        after = taxonomy.repair_class(finding)
+        if after:
+            write_finding(results_dir, finding)
+            changed.append({"finding_id": finding.get("finding_id"),
+                            "from": before, "to": after,
+                            "cwe": finding.get("cwe")})
+    return changed
+
+
+def check_class_consistency(results_dir: str | Path) -> list[dict]:
+    """Every finding whose label disagrees with its own CWE. Advisory.
+
+    Never deletes and never blocks: a finding whose class was guessed is still
+    a real defect. But the disagreement has to surface while the run is going,
+    because by report time it has already corrupted routing, dedupe grouping
+    and every CWE-keyed consumer downstream.
+    """
+    out: list[dict] = []
+    for finding in load_findings(results_dir):
+        problems = taxonomy.consistency_errors(finding)
+        if problems:
+            out.append({
+                "finding_id": finding.get("finding_id"),
+                "file": finding.get("file"),
+                "vuln_class": finding.get("vuln_class"),
+                "cwe": finding.get("cwe"),
+                "problems": problems,
+            })
+    return out
+
+
+def structural_dir(results_dir: str | Path) -> Path:
+    return Path(results_dir) / "structural"
+
+
+def load_structural(results_dir: str | Path) -> dict[str, dict]:
+    """Every stored structural verdict, keyed by finding_id."""
+    directory = structural_dir(results_dir)
+    out: dict[str, dict] = {}
+    if not directory.is_dir():
+        return out
+    for path in sorted(directory.glob("*.json")):
+        record = _read_json(path, default=None)
+        if isinstance(record, dict):
+            out[record.get("finding_id") or path.stem] = record
+    return out
+
+
+#: Structural outcomes that raise a finding's standing. One, deliberately —
+#: `oracle.structural.CORROBORATING` says the same thing on the oracle side.
+_CORROBORATING_STRUCTURAL = frozenset({"demonstrated"})
+
+
+def apply_structural(finding: dict, record: dict | None) -> dict:
+    """Merge ``structural/<id>.json``'s verdict into ``finding["structural"]``.
+
+    Same discipline as :func:`apply_proof`, and one extra rule that matters:
+
+    * a ``demonstrated`` verdict is **never** written into ``execution``. It is
+      not ``proven`` and it must not be countable as ``proven`` by a consumer
+      that reads only one field. The two live in separate keys because they are
+      separate claims, and ``report_build`` counts them under separate
+      denominators.
+    * ``refuted`` is recorded rather than dropped. It is evidence *against* the
+      finding, it never deletes anything, and ``phase2c_verify.md`` requires a
+      verifier confirming past it to say why in writing.
+    * nothing demotes: an existing ``demonstrated`` survives a later
+      ``probe_error`` (a container that would not start says nothing).
+    """
+    if not isinstance(record, dict) or not record:
+        return finding
+
+    verdict = record.get("verdict") if isinstance(record.get("verdict"), dict) else record
+    outcome = verdict.get("outcome")
+    if not isinstance(outcome, str) or not outcome:
+        return finding
+
+    current = finding.get("structural") or {}
+    if current.get("outcome") in _CORROBORATING_STRUCTURAL:
+        return finding
+
+    finding["structural"] = {
+        "outcome": outcome,
+        # Derived from the outcome so the two cannot disagree, exactly as
+        # `execution.proven` is.
+        "demonstrated": outcome in _CORROBORATING_STRUCTURAL,
+        "refuted": outcome == "refuted",
+        "probe_kind": verdict.get("probe_kind") or record.get("probe_kind"),
+        "reason": str(verdict.get("reason") or ""),
+        "conditions": dict(verdict.get("conditions") or {}),
+        "measurements": dict(verdict.get("measurements") or {}),
+        "evidence": list(verdict.get("evidence") or []),
+    }
+    return finding
+
+
+def apply_structurals(results_dir: str | Path) -> dict[str, str]:
+    """Apply every stored structural verdict to its finding, and persist."""
+    applied: dict[str, str] = {}
+    for finding_id, record in load_structural(results_dir).items():
+        finding = load_finding(results_dir, finding_id)
+        if finding is None:
+            continue
+        before = (finding.get("structural") or {}).get("outcome")
+        apply_structural(finding, record)
+        after = (finding.get("structural") or {}).get("outcome")
         if after != before:
             write_finding(results_dir, finding)
             applied[finding_id] = after or ""
     return applied
+
+
+def structural_outcome(finding: dict) -> str | None:
+    """The structural oracle's outcome, or None if no probe ever ran."""
+    outcome = (finding.get("structural") or {}).get("outcome")
+    return str(outcome) if outcome else None
+
+
+def structurally_demonstrated(finding: dict) -> bool:
+    """Deterministically demonstrated — **not** proven. Never merge the two."""
+    return bool((finding.get("structural") or {}).get("demonstrated"))
 
 
 def poc_succeeded(finding: dict, *, allow_model_claim: bool = False) -> bool:
@@ -416,7 +562,22 @@ def _unwrap(record: Any) -> list[dict]:
         return [record]
     nested = record.get("findings")
     if isinstance(nested, list):
-        return [f for f in nested if isinstance(f, dict) and f.get("finding_id")]
+        # The envelope's `task_id` is carried DOWN into each finding it wraps.
+        # Unwrapping without it silently deleted provenance the schema names
+        # and three consumers read: `coverage.py` attributes findings to tasks
+        # through `task_id`, and the payload nonce is derived from
+        # (run_id, task_id), so a finding that loses it becomes both
+        # uncountable and unreplayable. `record_finding` injects the same field
+        # on the write path; this is the read path agreeing with it.
+        envelope_task = record.get("task_id")
+        out = []
+        for finding in nested:
+            if not isinstance(finding, dict) or not finding.get("finding_id"):
+                continue
+            if envelope_task and not finding.get("task_id"):
+                finding = {**finding, "task_id": envelope_task}
+            out.append(finding)
+        return out
     return []
 
 
@@ -887,6 +1048,59 @@ def _cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_class_repair(args: argparse.Namespace) -> int:
+    changed = repair_classes(args.results_dir)
+    print(json.dumps({"repaired": len(changed), "changes": changed}, indent=2))
+    if changed:
+        print(f"{len(changed)} finding(s) re-labelled from a catch-all to the "
+              "class their CWE names. Re-run dedupe and the probe gate: routing "
+              "and probe eligibility both key on vuln_class.", file=sys.stderr)
+    return 0
+
+
+def _cmd_class_check(args: argparse.Namespace) -> int:
+    """Advisory, never fatal. A mislabelled finding is still a real finding."""
+    problems = check_class_consistency(args.results_dir)
+    print(json.dumps({"inconsistent": len(problems), "findings": problems},
+                     indent=2))
+    if problems:
+        print(f"{len(problems)} finding(s) carry a class that disagrees with "
+              "their own CWE. This corrupts routing, dedupe grouping and every "
+              "CWE-keyed consumer downstream — fix the labels before phase 4.",
+              file=sys.stderr)
+    return 0
+
+
+def _cmd_apply_structural(args: argparse.Namespace) -> int:
+    """Phase 2b's second step: make the structural verdicts count.
+
+    Exit 0 even when nothing changed — a run whose findings declared no probes
+    is a run with no structural evidence, which is a result and not a failure.
+    Note that `refuted` counts as "changed": a deterministic demonstration that
+    a defence works is exactly as much a result as a demonstration that it does
+    not, and phase 2c is required to read it.
+    """
+    applied = apply_structurals(args.results_dir)
+    demonstrated = sorted(k for k, v in applied.items() if v == "demonstrated")
+    refuted = sorted(k for k, v in applied.items() if v == "refuted")
+    print(json.dumps({
+        "applied": applied,
+        "demonstrated": demonstrated,
+        "refuted": refuted,
+        "demonstrated_count": len(demonstrated),
+        "refuted_count": len(refuted),
+        "updated": len(applied),
+        "note": ("`demonstrated` is not `proven`. It is never written into "
+                 "`execution`, and the report counts it under its own "
+                 "denominator."),
+    }, indent=2))
+    if refuted:
+        print(f"{len(refuted)} finding(s) were structurally REFUTED — phase 2c "
+              "must address each in writing before confirming it",
+              file=sys.stderr)
+    return 0
+
+
 def _cmd_apply_proofs(args: argparse.Namespace) -> int:
     """Phase 2b's last step: make the proof records count.
 
@@ -1001,6 +1215,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     apply_p.add_argument("--results-dir", required=True)
     apply_p.set_defaults(func=_cmd_apply_proofs)
+
+    apply_s = sub.add_parser(
+        "apply-structural",
+        help=("fold the structural oracle's verdicts into their findings "
+              "(corroboration-only; never writes `execution`)"),
+    )
+    apply_s.add_argument("--results-dir", required=True)
+    apply_s.set_defaults(func=_cmd_apply_structural)
+
+    class_check = sub.add_parser(
+        "class-check",
+        help="list findings whose vuln_class disagrees with their CWE (D-18)",
+    )
+    class_check.add_argument("--results-dir", required=True)
+    class_check.set_defaults(func=_cmd_class_check)
+
+    class_repair = sub.add_parser(
+        "class-repair",
+        help="rewrite catch-all classes to the class their CWE names (D-18)",
+    )
+    class_repair.add_argument("--results-dir", required=True)
+    class_repair.set_defaults(func=_cmd_class_repair)
 
     show = sub.add_parser("show", help="print one stored finding verbatim")
     show.add_argument("--results-dir", required=True)

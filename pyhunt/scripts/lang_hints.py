@@ -1392,6 +1392,62 @@ Report file + function + line, WHICH of the five checks failed, the exact
 source→sink path, and confidence: high for a delimiter mismatch or an
 unsanitized call site; medium for a theoretical partial-match edge case not
 yet proven by a generated-and-parsed file.""",
+
+    "resource": """\
+You are reviewing for resource exhaustion: attacker-chosen SIZE, DEPTH,
+COUNT, PRECISION and REPETITION driving unbounded allocation, unbounded
+recursion, or superlinear work. This is the availability half of input
+validation, and it is the lens most often lost — not because it is subtle,
+but because the surfaces it lives on get cleared by some OTHER lens asking a
+different question and never revisited.
+
+HARD GATE — every finding must name (a) the field or parameter an attacker
+controls, (b) the file:line where its value reaches an allocation, a loop
+bound, or a recursive call, and (c) what the victim loses: the process, the
+worker, the request budget. "This could be slow" is not a finding.
+
+Where to look:
+- SIZE / LENGTH / COUNT fields read out of a schema, header, or payload and
+  passed to `bytes(n)`, `bytearray(n)`, `[x] * n`, `range(n)`,
+  `os.urandom(n)`, `str * n`, or a preallocated buffer. The attacker picks
+  `n`; nothing clamps it.
+- PRECISION / SCALE / max_digits fields handed to a decimal, a fixed-width
+  type, or a formatter. A four-byte integer becomes a multi-gigabyte
+  allocation.
+- DEPTH: recursive descent over a nested structure with no depth counter —
+  schema→schema, union→union, type→type. Python raises RecursionError, which
+  is survivable; a C-implemented parser under the same recursion segfaults,
+  which is not.
+- SUPERLINEAR ALGORITHMS on attacker-sized input: `x in list` inside a loop,
+  string concatenation in a loop, a regex with nested quantifiers (ReDoS), a
+  sort with a comparator that re-parses, quadratic union resolution.
+- GENERATORS MATERIALISED: `list(...)`, `"".join(...)`, `json.dumps(...)`
+  over something lazily produced from attacker input — the laziness was the
+  only bound and it just got removed.
+- CACHES AND REGISTRIES keyed by attacker-controlled strings with no
+  eviction: every distinct key is a permanent allocation.
+
+TEST AND FIXTURE CODE COUNTS. A `.fake()` / `factory()` / `sample()` method
+that reads a schema-supplied size is in scope: library consumers call these
+in their own test suites with schemas they fetched from a registry, and
+"it is only test data" describes the intent, not the reachability. This
+paragraph exists because a sweep once cleared an entire `.fake()` surface
+with exactly that reasoning and two real unbounded-allocation findings were
+lost.
+
+PROOF. This class has a real oracle and you should use it — declare a
+`structural_probe` of kind `growth_curve` on the finding. The harness calls
+the target at an ascending ladder of sizes under RLIMIT_AS and RLIMIT_CPU in
+a forked child and decides in Python whether cost is superlinear or whether a
+rung died while the benign rung completed. You supply the callable and the
+size ladder; you do NOT supply the assertion. A finding whose growth you can
+describe but not measure is still worth filing — say so and give the
+reasoning.
+
+Report file + function + line, the controlled field, the ladder you expect,
+and confidence: high when the bound is plainly absent on a path from a public
+entry point; medium when a caller upstream might clamp it and you could not
+read that caller.""",
 }
 
 

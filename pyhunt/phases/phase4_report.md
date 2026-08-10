@@ -90,7 +90,59 @@ supplied a field the report computes. Fix the cause. Do not hand-write
 `report.md` to get past it: a report assembled by hand is a report whose
 numbers nobody checked.
 
-**4. Read `report.md` before showing it to anyone**, and confirm the four
+**4. Account for the cost.**
+
+```bash
+python3 "${PYHUNT_DIR}/scripts/cost.py" measure \
+  --results-dir "${RESULTS_DIR}" \
+  --transcript "${SESSION_TRANSCRIPT}" \
+  --markdown
+```
+
+Writes `logs/cost.json` and `logs/cost.md`. Append the markdown to the report.
+
+Add `--rates <table.json>` **only if the operator supplied one**. Without it the
+report states tokens, container runs and seconds, and says plainly that it is
+not stating money. Do not fill in a price you found somewhere — PyHunt ships no
+rate card on purpose (`config/cost_rates.example.json` explains why), and a
+dollar figure with no provenance is the same class of unfalsifiable claim as an
+unproven exploit.
+
+Two things this section must never do:
+
+- **Merge full-price tokens with cache reads.** On the recorded run cache reads
+  were 98.8% of all traffic and the cheapest line on any card. A single summed
+  "tokens" headline tracks the cheapest component and misstates the spend.
+- **Distribute unattributed tokens across phases by estimate.** If
+  `logs/phase_timing.json` is absent the per-phase split is simply unavailable,
+  and `cost.py` says so. A plausible split nobody measured is worse than a
+  stated gap.
+
+The number worth reading is **cost per settled finding**. Total spend says
+nothing on its own; spend per `proven` and per `demonstrated` is what says
+whether the two oracles earn their container time.
+
+**5. Export SARIF.**
+
+```bash
+python3 "${PYHUNT_DIR}/scripts/sarif_export.py" write \
+  --results-dir "${RESULTS_DIR}"
+```
+
+Writes `report.sarif` (SARIF 2.1.0), which GitHub code scanning, the VS Code
+SARIF viewer and most CI systems consume directly. It is the difference between
+a document a person reads once and a result a pipeline checks every commit.
+
+One thing about it is worth knowing rather than discovering: **SARIF has no
+field for "a container observed this fire."** Its `level` carries severity and
+nothing else, because every other scanner emitting SARIF is emitting static
+claims. So the settlement travels three other ways — `rank` (proven 100,
+demonstrated 90, everything else by severity), a `message` prefix in words, and
+`properties.execution` / `properties.structural` kept separate. Do not
+"simplify" any of those into `level`; that is the boundary at which this tool's
+one distinguishing output would become indistinguishable from a linter's.
+
+**6. Read `report.md` before showing it to anyone**, and confirm the five
 disclosures below are present and correct.
 
 ## Fields you must never write
@@ -114,7 +166,7 @@ outcome lives in `coverage.execution` (run-level counts) and in its
 that `fingerprint.py` wrote. Neither is a per-finding report field, so writing
 one produces a schema error rather than a silently ignored key.
 
-## The four disclosures
+## The five disclosures
 
 These are the difference between an advisory and a marketing document. Each must
 appear on its own, in the report, unmerged with the others.
@@ -217,9 +269,40 @@ failures, they are not hidden, and they are not quietly folded into an
 "unconfirmed" bucket. A reader must be able to tell a broken container from a
 missing environment from a question execution cannot answer.
 
-Alongside each finding, name the evidence class: **executed** (`proven`) or
-**reasoned** (everything else). Never present a reasoned finding and an executed
-one at the same visual weight without labelling which is which.
+Alongside each finding, name the evidence class: **executed** (`proven`),
+**demonstrated** (a structural probe held), or **reasoned** (everything else).
+Never present a reasoned finding and an executed one at the same visual weight
+without labelling which is which.
+
+### 5. The structural oracle's verdicts, beside the execution gate's and never summed
+
+`report_build.py` computes this into `coverage.execution.structural` and
+`reporting/markdown.py` renders it as its own block. What the report must hold:
+
+- **`demonstrated` is not `proven`.** They are claims from two different
+  oracles. `proven` means a dangerous operation fired, carried this PoC's nonce,
+  came from the target's own frame, and the payload was interpreted — witnessed
+  in three fresh containers. `demonstrated` means a deterministic predicate over
+  the target's own output held under a benign/hostile differential, measured by
+  a harness the hunter did not write. Both are real evidence. A reader handed
+  one merged "confirmed" column cannot tell them apart, and they are not equally
+  strong. **Never add them together, and never put them in the same column.**
+- **`refuted` is printed, not buried.** A probe that ran cleanly and showed the
+  defence holding is evidence against a finding that is nonetheless still in the
+  report (nothing in an oracle path deletes a finding). Phase 2c had to argue
+  past it in writing; the report shows both the verdict and that argument, and
+  lets the reader judge.
+- **"Probed" versus "not probed" is itself a disclosure.** If findings sit in
+  classes the audit hook cannot see and *no* probe was declared for them, the
+  report says so by name and by count. Otherwise "0 demonstrated" is ambiguous
+  between "we looked and found nothing" and "we never looked", which are
+  opposite facts about the run.
+
+The number that makes this disclosure worth having: on a real run, **74 of 145
+findings were `not_applicable`** — every verdict accurate, and none of them any
+help to a reader deciding whether the defect was real. The second oracle exists
+to turn "no execution could settle this" into "we settled it another way, here
+is the measurement", and the report has to make clear which of the two happened.
 
 ## Writing the findings
 
@@ -319,10 +402,47 @@ and it cannot be tracked if it is not reported.
 **Coverage**:        <V> of <E> enumerated inputs covered; <U> uncovered (listed below)
 ```
 
+## The reproduction bundle — a deliverable, not an afterthought
+
+Before the report is complete, write the bundle:
+
+```bash
+python3 "${PYHUNT_DIR}/scripts/repro_bundle.py" \
+  --results-dir "${RESULTS_DIR}" --skill-dir "${PYHUNT_DIR}"
+```
+
+It produces `repro/run_all.sh` plus, per finding, the PoC verbatim, the probe
+spec, the transcript this run actually captured, and a `verdict.txt` in words.
+`run.sh` re-runs each finding **through PyHunt's own gate** — the same container,
+the same observer, the same deterministic verdict — rather than through a
+bespoke runner that could disagree with the report without anyone noticing.
+
+This exists because of a measured gap. Benchmarked head to head against a
+comparison tool on the same package, PyHunt covered roughly four times the
+surface and verified everything adversarially — and lost outright on one column:
+the other tool shipped `run_all.sh`, a `poc.py` and a recorded `output.txt` per
+finding, so a reader could re-run the whole set in one command, while PyHunt's
+PoCs were buried inside `findings/*.json` and its transcripts inside
+`logs/replay/`. That was a packaging failure, not an analysis one, and packaging
+failures are the cheap kind to fix.
+
+Include the failures. Every finding gets a directory, including the ones whose
+outcome was `not_applicable`, `probe_error` or `refuted`. A bundle containing
+only the wins answers the wrong question — the interesting one a reader asks is
+"what did you try that did not work", and the answer must be one directory
+listing away.
+
 ## Before this phase is complete
 
 - [ ] `report.json` and `report.md` exist and `report_build.py` exited 0 —
       which means `--markdown` and `--narrative` were both passed.
+- [ ] `repro/run_all.sh` exists and `repro/manifest.json` lists every finding,
+      with `rerunnable` equal to the number that carry a PoC or a probe.
+- [ ] `dedupe.py run` was executed, so the report shows one canonical row per
+      site rather than one per hunt unit that happened to find it, and
+      `independent_units` is printed wherever more than one unit converged.
+- [ ] `repo_guard.py assert` passed: the target repository is byte-identical to
+      the tree this run started against.
 - [ ] `narrative_findings_with_prose` equals the number of delivered findings.
       A lower number means prose you wrote never reached the report; check
       `narrative_unmatched_finding_ids`.
@@ -333,6 +453,10 @@ and it cannot be tracked if it is not reported.
 - [ ] Proven, provable, not-provable-by-this-observer and total appear as four
       separate numbers, and the fourth is described as a limit of PyHunt's
       observer rather than as a property of those findings.
+- [ ] The structural oracle's counts appear in their own block, never summed
+      with the execution gate's, with `demonstrated` explicitly distinguished
+      from `proven` — and if no probe ran while observer-blind findings exist,
+      the report says so by count.
 - [ ] The uncovered-input list is present, with reasons — or the report says
       explicitly that every enumerated input was covered.
 - [ ] No sentence implies exhaustiveness while `coverage_complete` is false or

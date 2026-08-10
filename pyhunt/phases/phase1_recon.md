@@ -1,14 +1,15 @@
 # Phase 1 — Recon: the input inventory
 
-> **Reads:** `${RESULTS_DIR}/preflight.json` (mode, language census), the target
-> repository, and `${RESULTS_DIR}/logs/history.json` produced by step 1 below.
+> **Reads:** `${RESULTS_DIR}/preflight.json` (mode, language census),
+> `${RESULTS_DIR}/logs/recon_enumeration.json`,
+> `${RESULTS_DIR}/logs/history.json`, and the target repository.
 > **Writes:** `${RESULTS_DIR}/inputs.json`.
 > **Gate:** Phase 1b may not start until `inputs.json` exists, every input has a
 > unique `input_id` and a `file:line` you actually read, and the `history` array
 > is present.
 
-This phase runs as a subagent. Its tool envelope is **Read, Grep, Glob — no
-Bash.** See "What moved out of this phase" for why that changed.
+This phase runs as a subagent. Its tool envelope is **Read — no Bash, no Grep,
+no Glob.** See "What moved out of this phase" for why that changed, twice.
 
 ---
 
@@ -57,6 +58,33 @@ suggestion**. You may not filter it, re-rank it, or drop entries you disagree
 with. If an entry looks wrong, enumerate against it anyway and say so in that
 input's `notes`.
 
+### And then the enumeration moved too (D6)
+
+The paragraph above was written, the phase kept its Grep and Glob, and the
+property still was not held: the harness could not supply Grep or Glob, so the
+recon agent delegated the whole structural pass to a **nested Bash subagent**.
+The prompt said no Bash; a Bash ran anyway, over the most attacker-authored
+content in the run. Defect D6.
+
+The same reasoning that moved the history mining applies to the file walk, the
+extension census, the framework detection, and the entry-point grep. All four
+are `os.walk` plus regex wearing an LLM costume. They are now
+`scripts/recon_enumerate.py`, and SKILL.md runs it before dispatching you:
+
+```bash
+python3 "${SKILL_DIR}/scripts/recon_enumerate.py" enumerate \
+  --repo "${TARGET}" --results-dir "${RESULTS_DIR}"
+```
+
+**You have `Read` and nothing else.** That is an envelope the harness can
+actually supply, so the property is now held rather than requested.
+
+What you gain, beyond the envelope: a candidate set that is byte-identical
+across two scans of the same commit, that does not thin out at file 300 because
+context got tight, and that already contains the public API surface — for a
+library target, `public_api[]` is the attack surface, computed with `ast`
+instead of by remembering to be thorough.
+
 ---
 
 ## Step 1 — Run the history miner
@@ -91,39 +119,77 @@ yourself.
 
 ---
 
-## Step 2 — Structural pass
+## Step 2 — Read the enumeration
 
-Use **Glob** in parallel to map the target:
+**Read `${RESULTS_DIR}/logs/recon_enumeration.json`.** It is already written.
+The structural pass this step used to describe has been done for you:
 
-- `**/*.py`, plus `**/*.jinja2`, `**/*.j2`, `**/*.mako`, `**/*.html` (templates
-  are where codegen and SSTI live), and manifests: `pyproject.toml`,
-  `requirements*.txt`, `setup.py`, `Dockerfile`, `docker-compose.yml`.
+| key | what it holds | how to use it |
+|---|---|---|
+| `files[]` | every source file, with `lines`, `reachable_from`, `status` | your reading list. `status` other than `read` says why a file was not analysed. |
+| `extension_census` | counts by extension | tells you if a language is present that the sink tables do not cover — say so in the summary. |
+| `reachability_census` | counts by tier | `test`, `ci`, `example` files are **enumerated, not excluded**. See below. |
+| `frameworks[]` | each with `confidence` and `evidence` | `confirmed` first. See the confidence rule below. |
+| `manifests[]` | dependency names per manifest, with `scope` | read, never run. |
+| `entry_point_candidates` | by category, with `matched` vs `kept` | your grep results. Open each one. |
+| `indirect_dispatch` | dispatch tables, registries, dynamic imports | every target behind one is its own entry point. |
+| `public_api[]` | every exported callable and its parameter names | **for a library target this is the attack surface.** |
 
-Exclude from enumeration: `**/tests/**`, `test_*.py`, `*_test.py`, `**/vendor/**`,
-`**/node_modules/**`, `**/.venv/**`, `**/site-packages/**`, `**/migrations/**`,
-`**/*.egg-info/**`, and generated code.
+### The confidence rule on `frameworks[]`
 
-Read the manifests — do not run them. You are identifying:
+A claim is graded, and the grade changes what you do with it:
 
-- The **web framework**, if any: Flask, Django, FastAPI, Starlette, aiohttp,
-  Tornado, Bottle, Pyramid, Sanic.
-- The **task/queue layer**: Celery, RQ, Dramatiq, Kafka, boto3 SQS, Pika.
-- The **serialisation surface**: PyYAML, pickle, dill, joblib, torch, jsonpickle,
-  msgpack.
-- The **template engine**: Jinja2, Mako, Chameleon, string.Template.
-- The **CLI layer**: argparse, click, typer, fire.
-- The **ORM / DB driver**: SQLAlchemy, Django ORM, psycopg, sqlite3, pymongo.
+- **`confirmed`** — imported by first-party source. Enumerate its input APIs in
+  full.
+- **`peripheral`** — imported only by examples, tests, docs or CI. Real, and its
+  entry points are real; they are just reachable from a different place. Still
+  enumerate them, and let `reachable_from` carry the urgency.
+- **`declared`** — named by a root manifest, never imported. Look once for a
+  usage the import regex missed, then move on.
+- **`transitive`** — named only by a lock file. **This is not a framework of
+  this project.** A lock file lists the transitive closure of a dev
+  environment; on the first real target this produced tornado, kafka and
+  aiohttp for a schema library that uses none of them. Do not enumerate an HTTP
+  surface that does not exist.
 
-These determine which input-parsing APIs you grep for next. Build your patterns
-from what is actually in this repository — the lists below are starting points,
-not a checklist to run verbatim.
+### Tests, CI and examples are enumerated
+
+This step used to say "exclude `**/tests/**`". That was wrong, and it cost real
+findings: the recorded run surfaced a `publish.yaml` tag trigger and several
+test-harness issues, all genuine. A file dropped from the inventory produces no
+gap, no warning, and a silently smaller denominator.
+
+So nothing is excluded for being a test. Every file carries a `reachable_from`
+tier — `public_api`, `internal`, `ci`, `test`, `example`, `build` — which flows
+onto every finding and lets a reader sort by reachability. **Sorting is the
+reader's job. Dropping is nobody's.**
+
+Only vendored trees (`node_modules/`, `.venv/`, `site-packages/`, `vendor/`)
+and generated artefacts are excluded, and each exclusion is recorded in
+`excluded[]` with the rule that caused it.
+
+### What you still owe
+
+The enumeration gives you *candidates*. It cannot tell you what an input **is**,
+what it is called, or who can reach it. That is Step 3, it needs the code
+opened, and it is the reason this phase still has an agent in it.
 
 ---
 
 ## Step 3 — Enumerate the inputs
 
-For each framework you detected, grep its input-parsing APIs to find entry
-points, then **read each entry point** and enumerate every input it receives.
+`entry_point_candidates` has already found the call sites. **Open each one** and
+enumerate every input it receives.
+
+The tables below are the vocabulary the enumerator swept with, kept here because
+you need to recognise what you are looking at when you open a candidate — and
+because a candidate list is a floor, not a ceiling. When you read a file and see
+an input the sweep did not flag, **enumerate it**. A regex finds the idioms it
+was given; you find the ones it was not, and that difference is why this phase
+still has an agent in it.
+
+Where a category shows `matched` greater than `kept`, the sweep was bounded.
+Open the file the last kept hit points at and read the rest of it yourself.
 
 **HTTP**
 - Flask / Quart: `request.args`, `request.form`, `request.json`,
@@ -170,10 +236,10 @@ points, then **read each entry point** and enumerate every input it receives.
 
 ### Indirect dispatch
 
-Grep for functions stored in dicts, lists, or registries and called
-dynamically — `handlers[kind](payload)`, `getattr(mod, name)(...)`, plugin
-registries, entry-point loading, `functools.singledispatch`, strategy tables,
-decorator-registered callbacks.
+`indirect_dispatch.hits[]` lists the sites: functions stored in dicts, lists, or
+registries and called dynamically — `handlers[kind](payload)`,
+`getattr(mod, name)(...)`, plugin registries, entry-point loading,
+`functools.singledispatch`, strategy tables, decorator-registered callbacks.
 
 Enumerate **every target** in the dispatch table as its own entry point. Each
 one receives the data the dispatcher received, and a forward trace that stops at
@@ -367,6 +433,11 @@ Proceed only when:
 - [ ] every `trust_level` is one of the four enum values, verbatim
 - [ ] every entry point found in Step 2 appears in at least one input row, or has
       a `no-input endpoint` row
+- [ ] every `entry_point_candidates` hit whose framework is `confirmed` or
+      `peripheral` has been opened, and either produced an input row or is named
+      in the phase summary with the reason it produced none
+- [ ] for a library target, every `public_api[]` symbol's parameters are covered
+      by input rows, or the summary says which are not and why
 - [ ] `history` is present (possibly `[]`) and, when non-empty, byte-identical to
       the miner's array
 - [ ] zero inputs is reported explicitly with the reason, not left implicit
@@ -386,8 +457,17 @@ file.
   different paths. See the sibling-input rule.
 - **Inferring trust level from a path prefix or a comment.** Cite the enforcing
   code or write `unauthenticated`.
-- **Re-running the history mining because you have an idea for a better grep.**
-  You have no Bash, and the determinism is the feature.
+- **Re-running the history mining, or the enumeration, because you have an idea
+  for a better grep.** You have no Bash, no Grep and no Glob, and the
+  determinism is the feature. An idea for a better pattern is a real
+  contribution — put it in the phase summary so it can be added to
+  `recon_enumerate.py`, where it will apply to every future run instead of
+  this one.
+- **Treating `entry_point_candidates` as the complete list.** It is a floor.
+  An input you find by reading that the sweep did not flag is exactly the value
+  you add.
+- **Enumerating a `transitive` framework's surface.** A lock file is not a
+  statement that this project uses the package.
 - **Reporting an empty inventory for a library target.** A library's public
   functions are its attack surface.
 - **Writing a `location` you did not open.** It resolves to the wrong symbol in

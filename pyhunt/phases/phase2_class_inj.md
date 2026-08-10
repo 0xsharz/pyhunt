@@ -359,6 +359,75 @@ assertion rather than an observed event.
 
 ---
 
+## 6a. Codegen injection — declare a `codegen_ast` probe, and mind the indent
+
+`codegen_injection` is the one class in this group the audit hook **cannot see
+at all**. Writing a `.py` file containing an attacker-controlled call raises no
+CPython audit event, and a PoC that runs the generated module hands condition 4
+a filename its own `compile()` minted — the C-4 defence working exactly as
+designed. Every such PoC returns `not_applicable`, correctly, forever. On one
+real run that was 74 of 145 findings.
+
+So this class is settled by the **second oracle** (`phase2_shared.md` §6.8).
+Declare the probe; do not write the assertion.
+
+```json
+"structural_probe": {
+  "kind": "codegen_ast",
+  "target": "pkg.model_generator.generator.ModelGenerator.render",
+  "construct": "pkg.model_generator.generator.ModelGenerator",
+  "benign_kwargs": {"schema": {"type": "record", "name": "M",
+                               "doc": "an ordinary docstring $PYHUNT_BENIGN",
+                               "fields": [{"name": "a", "type": "string"}]}},
+  "hostile_kwargs": {"schema": {"type": "record", "name": "M",
+                                "doc": "x\"\"\"\npyhunt_$PYHUNT_NONCE()\n\"\"\"",
+                                "fields": [{"name": "a", "type": "string"}]}},
+  "rationale": "record `doc` is interpolated into the emitted class docstring with no escaping"
+}
+```
+
+**The indentation trap, which you will hit.** A generator usually re-indents the
+continuation lines of a docstring to the class body's level. If your payload
+carries its own four spaces, they are added to the generator's four and the
+injected statement lands at eight — a `SyntaxError: unexpected indent`, and the
+oracle returns `inconclusive` rather than `demonstrated`:
+
+> "the attacker's text changed the emitted module enough that it no longer
+> parses. That proves the payload escaped its literal, but not that what it
+> became is executable — a syntax error is a broken generator, not a
+> demonstrated injection."
+
+That is the oracle refusing to over-claim, and it is right to. Write the payload
+with **no leading whitespace on the injected line** and let the generator supply
+the indentation. Verified against a live generator: with the payload above, the
+emitted module is
+
+```python
+class M(AvroModel):
+    """
+    x"""
+    pyhunt_<nonce>()
+    """
+    """
+    a: str
+```
+
+— the nonce is a `Name` node inside an `Expr` statement, where the benign
+control produced an inert `Expr(Constant)`. Differential holds; verdict
+`demonstrated`, 2/2 unanimous.
+
+**Prefer the nonce as an identifier** (`pyhunt_<nonce>()`) over the nonce inside
+a string argument (`system("touch /canary/<nonce>")`). Both are read correctly —
+the harness inspects the enclosing statement as well as the innermost node — but
+an identifier makes the answer unambiguous in one field rather than two.
+
+**Aim at the field the generator actually renders.** If the benign marker never
+reaches the generated source, the probe is a `probe_error` and says nothing:
+the payload went into a field this generator ignores. Check which fields the
+template consumes before choosing one.
+
+---
+
 ## 7. Do not eliminate these
 
 - **Any attacker-controlled unsanitised value that crosses a tier boundary** —

@@ -667,16 +667,27 @@ def _next_reconcile_index(tasks: Sequence[Mapping[str, Any]]) -> int:
     return highest + 1
 
 
-def reconcile(results_dir: Path, *, cap: int = RECONCILE_CAP) -> dict[str, Any]:
-    """Synthesize up to ``cap`` hunt tasks, one per uncovered input.
+def reconcile(results_dir: Path, *, cap: int = RECONCILE_CAP,
+              write: bool = True) -> dict[str, Any]:
+    """Synthesize up to ``cap`` hunt tasks, one per uncovered input, and append them.
 
     Classification is recomputed here rather than read back from
     ``coverage.json`` on purpose: the tasks must be derived from the *current*
     state of the results directory, and a stale ledger left by an earlier phase
     would otherwise re-queue work that has since been covered.
 
-    Mutates nothing. The skill decides whether these tasks are appended to
-    ``tasks.json``.
+    **This writes ``tasks.json``.** It used to print the tasks on stdout, exit
+    0, and mutate nothing, with no phase file saying who was supposed to perform
+    the append — so the re-queue step could silently do nothing while every
+    downstream gate still passed, because ``uncovered`` is a legal disposition.
+    A run in that state reports an honest-looking ledger over work that was
+    never done. Observed: 54 uncovered inputs, 20 tasks emitted, ``tasks.json``
+    unchanged.
+
+    The append is additive and idempotent by task id, a timestamped backup is
+    written beside the file first, and ``written``/``backup_path`` come back in
+    the result so the caller can assert the write landed. Pass ``write=False``
+    for the old preview behaviour.
     """
     inputs, _ = load_inputs(results_dir)
     tasks, _ = load_tasks(results_dir)
@@ -690,7 +701,338 @@ def reconcile(results_dir: Path, *, cap: int = RECONCILE_CAP) -> dict[str, Any]:
         _synthesize_reconcile_task(inp, start + offset)
         for offset, inp in enumerate(capped)
     ]
-    return {"tasks": synthesized, **plan, "notes": _plan_notes(plan)}
+    result: dict[str, Any] = {"tasks": synthesized, **plan,
+                              "notes": _plan_notes(plan)}
+    if write and synthesized:
+        result.update(append_tasks(results_dir, synthesized))
+    else:
+        result["written"] = 0
+        result["backup_path"] = None
+        if synthesized and not write:
+            result["notes"] = list(result["notes"]) + [
+                f"{len(synthesized)} task(s) were NOT written (write=False). "
+                "Nothing downstream will hunt them."
+            ]
+    return result
+
+
+def append_tasks(results_dir: Path,
+                 new_tasks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Append tasks to ``tasks.json``, preserving its shape and backing it up.
+
+    Both shapes ``load_tasks`` accepts are preserved on write — a bare array
+    stays a bare array, ``{"tasks": [...]}`` keeps its wrapper and its sibling
+    keys. Rewriting one into the other would be a silent contract change to a
+    file three later phases read.
+
+    Duplicate task ids are skipped rather than appended twice: two tasks sharing
+    an id make every finding they produce unattributable, which is the failure
+    ``_next_reconcile_index`` already exists to avoid on resumed runs.
+    """
+    path = results_dir / "tasks.json"
+    existing_payload: Any
+    if path.exists():
+        existing_payload = _read_json(path)
+    else:
+        existing_payload = {"tasks": []}
+
+    if isinstance(existing_payload, Mapping):
+        records = list(existing_payload.get("tasks") or [])
+        container = "object"
+    elif isinstance(existing_payload, list):
+        records = list(existing_payload)
+        container = "array"
+    else:
+        raise ContractViolation(
+            f"tasks.json is a {type(existing_payload).__name__}; expected an "
+            "array of tasks or an object carrying a 'tasks' array"
+        )
+
+    known = {_task_id(t) for t in records if isinstance(t, Mapping)}
+    appended = [t for t in new_tasks if _task_id(t) not in known]
+
+    backup_path: Path | None = None
+    if path.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = path.with_suffix(f".json.before_reconcile.{stamp}.bak")
+        backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    records.extend(appended)
+    if container == "object":
+        payload: Any = dict(existing_payload)
+        payload["tasks"] = records
+    else:
+        payload = records
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    # Read back rather than trust the write. The whole defect this function
+    # exists to close was "the step reported success and the file was unchanged".
+    verify, _ = load_tasks(results_dir)
+    landed = {_task_id(t) for t in verify}
+    missing = [_task_id(t) for t in appended if _task_id(t) not in landed]
+    if missing:
+        raise ContractViolation(
+            "tasks.json was written but does not contain "
+            f"{len(missing)} of the appended task(s): {', '.join(missing[:10])}"
+        )
+    return {
+        "written": len(appended),
+        "skipped_duplicate_ids": len(list(new_tasks)) - len(appended),
+        "tasks_total": len(records),
+        "backup_path": str(backup_path) if backup_path else None,
+        "tasks_path": str(path),
+    }
+
+
+# ---------------------------------------------------------------------------
+# probe-gap — findings the second oracle could settle and was never asked to
+# ---------------------------------------------------------------------------
+
+_PG_TASK_ID = re.compile(r"^t_pg_(\d+)$")
+
+
+def _next_probe_index(tasks: Sequence[Mapping[str, Any]]) -> int:
+    highest = 0
+    for task in tasks:
+        match = _PG_TASK_ID.match(_task_id(task))
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return highest + 1
+
+
+def probe_gap(results_dir: Path, *, cap: int = RECONCILE_CAP,
+              write: bool = True) -> dict[str, Any]:
+    """Re-queue every finding the structural oracle could settle and was not asked to.
+
+    The oracle works — verified `demonstrated` end to end against a real
+    generator. On the recorded run **1 of 74** observer-blind findings would
+    have carried a probe, because declaring one is optional. An optional oracle
+    produces exactly the same report as no oracle, and the same shape of defect
+    as `reconcile` printing tasks nobody appended: everything downstream still
+    passes and the work silently did not happen.
+
+    So a finding whose class the audit hook cannot see, carrying no
+    `structural_probe`, becomes a task whose job is to author one — bounded,
+    written, and read back, like every other re-queue in this phase.
+    """
+    try:
+        from oracle.structural import probe_kind_for
+    except ImportError:  # pragma: no cover - a half-installed tree
+        return {"eligible": 0, "missing": 0, "tasks": [], "written": 0,
+                "notes": ["oracle.structural is unavailable; no probe gap computed"]}
+
+    findings = _load_findings_for_probe_gap(results_dir)
+    tasks_existing, _ = load_tasks(results_dir)
+
+    eligible: list[Mapping[str, Any]] = []
+    for finding in findings:
+        if not probe_kind_for(str(finding.get("vuln_class") or "")):
+            continue
+        eligible.append(finding)
+
+    missing = [f for f in eligible if not f.get("structural_probe")]
+    # One task per SITE, not per finding: five duplicates of one defect need one
+    # probe between them, and five identical tasks would burn the cap.
+    seen: set[tuple[str, str]] = set()
+    unique: list[Mapping[str, Any]] = []
+    for finding in missing:
+        key = (str(finding.get("file") or ""), str(finding.get("vuln_class") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(finding)
+
+    capped = unique[:cap]
+    dropped = len(unique) - len(capped)
+    start = _next_probe_index(tasks_existing)
+    synthesized = [
+        _synthesize_probe_task(finding, start + offset, probe_kind_for(
+            str(finding.get("vuln_class") or "")))
+        for offset, finding in enumerate(capped)
+    ]
+
+    notes: list[str] = []
+    if dropped:
+        notes.append(
+            f"{dropped} finding site(s) eligible for a structural probe exceeded "
+            f"the cap ({cap}) and were NOT re-queued. They will be reported on "
+            "their static argument alone.")
+    if not missing:
+        notes.append("every probe-eligible finding already carries a probe")
+
+    result: dict[str, Any] = {
+        "eligible": len(eligible),
+        "already_probed": len(eligible) - len(missing),
+        "missing": len(missing),
+        "unique_sites": len(unique),
+        "requeued": len(synthesized),
+        "dropped_beyond_cap": dropped,
+        "cap": cap,
+        "tasks": synthesized,
+        "notes": notes,
+    }
+    if write and synthesized:
+        result.update(append_tasks(results_dir, synthesized))
+    else:
+        result["written"] = 0
+        result["backup_path"] = None
+    return result
+
+
+def _load_findings_for_probe_gap(results_dir: Path) -> list[Mapping[str, Any]]:
+    out: list[Mapping[str, Any]] = []
+    directory = results_dir / "findings"
+    if not directory.is_dir():
+        return out
+    for path in sorted(directory.glob("*.json")):
+        try:
+            payload = _read_json(path)
+        except ContractViolation:
+            continue
+        if isinstance(payload, Mapping) and isinstance(payload.get("findings"), list):
+            out.extend(f for f in payload["findings"] if isinstance(f, Mapping))
+        elif isinstance(payload, Mapping) and payload.get("finding_id"):
+            out.append(payload)
+    return out
+
+
+def _synthesize_probe_task(finding: Mapping[str, Any], n: int,
+                           probe_kind: str | None) -> dict[str, Any]:
+    file = str(finding.get("file") or "")
+    return {
+        "task_id": f"t_pg_{n}",
+        "source": "probe_gap",
+        "attack_class": str(finding.get("vuln_class") or "improper_input_handling"),
+        "target_files": [file] if file else [],
+        "priority": 2,
+        "scope_hint": (
+            f"Author a `{probe_kind}` structural_probe for {finding.get('finding_id')} "
+            f"at {file}:{finding.get('line_start')}. Do not re-file the finding — "
+            "it already exists. Emit only the probe spec, per phase2_shared.md §6.8."
+        ),
+        "rationale": (
+            "this finding is in a class the audit-hook observer has no event for, "
+            "so execution can never settle it, and no structural probe was "
+            "declared — it would be reported on its static argument alone"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# read-ledger — W4.2
+#
+# The coverage ledger is INPUT-level: it proves every enumerated input reached a
+# disposition. It says nothing about whether the agent that answered a task
+# actually opened the files the task named. A unit assigned five files can
+# report "no findings" having read two, and every downstream check still passes
+# — the task has an outcome, the inputs have dispositions, the coverage number
+# is full. The gap has no name and produces no warning.
+#
+# `files_read` on the hunt output closes that. This function joins it against
+# `tasks.json` and reports, per task, which target files were never opened.
+#
+# It is a REPORT, not a gate. A file legitimately goes unread — the task was
+# answered from another file, or the file turned out to be generated — and
+# failing the run for it would push agents toward inflating the list, which
+# converts a measurable gap into an unmeasurable lie. Naming it is what makes it
+# actionable; `phase3_sweep.md` re-queues what this surfaces.
+# ---------------------------------------------------------------------------
+
+
+def _norm_path(path: str) -> str:
+    """Repo-relative, forward slashes, no leading `./`.
+
+    Not `lstrip("./")`: that strips any leading run of `.` and `/`, so
+    `.github/workflows/publish.yaml` becomes `github/...` and matches nothing.
+    """
+    text = str(path or "").replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text.lstrip("/")
+
+
+def load_files_read(results_dir: Path) -> tuple[dict[str, set[str]], list[str]]:
+    """`{task_id: {path, ...}}` from every hunt output that reported one."""
+    by_task: dict[str, set[str]] = {}
+    silent: list[str] = []
+    directory = results_dir / "findings"
+    if not directory.is_dir():
+        return by_task, silent
+    for path in sorted(directory.glob("*.json")):
+        try:
+            payload = _read_json(path)
+        except ContractViolation:
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        task_id = payload.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        read = payload.get("files_read")
+        if not isinstance(read, list):
+            silent.append(task_id)
+            continue
+        by_task.setdefault(task_id, set()).update(
+            _norm_path(p) for p in read if isinstance(p, str) and p)
+    return by_task, silent
+
+
+def read_ledger(results_dir: Path) -> dict[str, Any]:
+    """Which assigned files were never opened, per task."""
+    tasks, notes = load_tasks(results_dir)
+    by_task, silent = load_files_read(results_dir)
+
+    rows: list[dict[str, Any]] = []
+    unread_files: set[str] = set()
+    fully_read = 0
+    for task in tasks:
+        task_id = str(task.get("task_id") or "")
+        assigned = {
+            _norm_path(p)
+            for p in (task.get("target_files") or []) if isinstance(p, str) and p
+        }
+        if not task_id or not assigned:
+            continue
+        opened = by_task.get(task_id)
+        if opened is None:
+            rows.append({
+                "task_id": task_id,
+                "assigned": sorted(assigned),
+                "unread": sorted(assigned),
+                "status": "not_reported",
+            })
+            unread_files |= assigned
+            continue
+        missing = assigned - opened
+        if missing:
+            rows.append({
+                "task_id": task_id,
+                "assigned": sorted(assigned),
+                "unread": sorted(missing),
+                "status": "partial",
+            })
+            unread_files |= missing
+        else:
+            fully_read += 1
+
+    payload: dict[str, Any] = {
+        "tasks_with_targets": sum(1 for t in tasks if t.get("target_files")),
+        "tasks_fully_read": fully_read,
+        "tasks_partially_read": sum(1 for r in rows if r["status"] == "partial"),
+        "tasks_not_reporting": sum(1 for r in rows if r["status"] == "not_reported"),
+        "unread_files": sorted(unread_files),
+        "rows": rows,
+        "notes": notes,
+    }
+    if silent:
+        payload["outputs_without_files_read"] = sorted(set(silent))[:50]
+    payload["interpretation"] = (
+        "A file in scope and never opened is a gap with a name. This is a "
+        "report, not a gate: failing a run for an unread file would push units "
+        "toward inflating the list, which converts a measurable gap into an "
+        "unmeasurable one."
+    )
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +1190,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconcile_cmd.add_argument("--results-dir", required=True, type=Path)
     reconcile_cmd.add_argument("--cap", type=int, default=RECONCILE_CAP)
+    probe_cmd = sub.add_parser(
+        "probe-gap",
+        help="re-queue findings the structural oracle could settle and was not asked to",
+    )
+    probe_cmd.add_argument("--results-dir", required=True, type=Path)
+    probe_cmd.add_argument("--cap", type=int, default=RECONCILE_CAP)
+    probe_cmd.add_argument("--dry-run", action="store_true")
+
+    reconcile_cmd.add_argument(
+        "--dry-run", action="store_true",
+        help=("print the synthesized tasks without appending them to "
+              "tasks.json. The default is to WRITE: a re-queue step that emits "
+              "tasks nobody appends leaves the ledger honest and the work "
+              "undone, and every downstream gate still passes."))
+
+    read_cmd = sub.add_parser(
+        "read-ledger",
+        help=("report which assigned files a hunt unit never opened. A report, "
+              "not a gate — see the module note on why failing here would make "
+              "the number worse"),
+    )
+    read_cmd.add_argument("--results-dir", required=True, type=Path)
 
     assert_cmd = sub.add_parser(
         "assert-complete",
@@ -896,6 +1260,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.stdout.write("\n")
             return 0
 
+        if args.command == "read-ledger":
+            if not results_dir.is_dir():
+                raise ContractViolation(
+                    f"results directory {results_dir} does not exist"
+                )
+            payload = read_ledger(results_dir)
+            print(
+                f"coverage: {payload['tasks_fully_read']} task(s) read every "
+                f"assigned file, {payload['tasks_partially_read']} partially, "
+                f"{payload['tasks_not_reporting']} reported nothing; "
+                f"{len(payload['unread_files'])} file(s) assigned and never "
+                f"opened",
+                file=sys.stderr,
+            )
+            json.dump(payload, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+            return 0
+
         if args.command == "classify":
             if not results_dir.is_dir():
                 raise ContractViolation(
@@ -920,11 +1302,41 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ContractViolation(
                     f"results directory {results_dir} does not exist"
                 )
-            result = reconcile(results_dir, cap=args.cap)
+            result = reconcile(results_dir, cap=args.cap,
+                               write=not args.dry_run)
             print(
                 f"coverage: {result['uncovered']} uncovered input(s); "
                 f"{result['requeued']} re-queued as hunt tasks "
                 f"(cap={result['cap']})",
+                file=sys.stderr,
+            )
+            if args.dry_run:
+                print("coverage: --dry-run — tasks.json was NOT written",
+                      file=sys.stderr)
+            else:
+                print(
+                    f"coverage: appended {result.get('written', 0)} task(s) to "
+                    f"{result.get('tasks_path')} "
+                    f"(backup: {result.get('backup_path')})",
+                    file=sys.stderr,
+                )
+            for note in result["notes"]:
+                print(f"coverage: {note}", file=sys.stderr)
+            json.dump(result, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+            return 0
+
+        if args.command == "probe-gap":
+            if not results_dir.is_dir():
+                raise ContractViolation(
+                    f"results directory {results_dir} does not exist"
+                )
+            result = probe_gap(results_dir, cap=args.cap, write=not args.dry_run)
+            print(
+                f"coverage: {result['missing']} of {result['eligible']} "
+                f"probe-eligible finding(s) carry no structural probe; "
+                f"{result['requeued']} site(s) re-queued "
+                f"(wrote {result.get('written', 0)})",
                 file=sys.stderr,
             )
             for note in result["notes"]:
