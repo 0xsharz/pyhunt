@@ -313,6 +313,76 @@ def _boring_open(path: object) -> bool:
     return any(norm.startswith(root) for root in _NOISE_ROOTS)
 
 
+#: The filename CPython hands `ast.parse` when PEP-657 renders caret anchors
+#: for a traceback frame. See :func:`_is_traceback_caret_compile`.
+_PEP657_FILENAME = "<unknown>"
+
+#: The stdlib module that compiles while *formatting an exception*.
+#:
+#: `traceback.py` only, deliberately, and this is not a detail. The obvious
+#: reading is to also match `ast.py`, since PEP-657 reaches `compile` through
+#: `ast.parse` — but `ast.py` is where `ast.literal_eval` lives, and a target
+#: calling `literal_eval` on attacker input raises a `compile` event that is
+#: exactly the security-relevant signal this observer exists to catch. Matching
+#: `ast.py` suppressed it: PyHunt's own sanitized `code_evaluation` twin
+#: silently changed verdict from `sink_reached_unproven` to `no_event`, i.e. a
+#: working defence stopped being visible as one. `traceback.py` is on the stack
+#: for caret rendering and is not on it for `literal_eval`, so it separates the
+#: two cleanly.
+_TRACEBACK_RENDERERS = ("traceback.py",)
+
+
+def _is_traceback_caret_compile(args: tuple) -> bool:
+    """True for the `compile` event PEP-657 raises while printing a traceback.
+
+    On CPython >= 3.11 `traceback` renders caret anchors (`~~~~^^^^`) by calling
+    `ast.parse` on each frame's source segment. `ast.parse` calls `compile`,
+    which raises a **watched** audit event attributed to whichever frame is
+    printing the traceback — in practice the PoC's own `except` block.
+
+    The gate then rules `self_attributed`, which means "the PoC called the sink
+    directly and therefore proved nothing". That verdict is wrong here: the PoC
+    called `traceback.print_exc()`, and the interpreter compiled something on its
+    own behalf. Four findings of one real run lost their honest `no_event` to
+    this, and catching an exception and printing it is ordinary PoC behaviour.
+
+    Two conditions, both required, so a target that genuinely compiles attacker
+    input can never be filtered out by this:
+
+    1. the filename is exactly ``<unknown>`` — what `ast.parse` passes for a
+       bare source segment, and not something real code passes by accident; and
+    2. a **stdlib** `traceback.py` or `ast.py` frame is on the stack right now.
+
+    The stdlib check matters: a target file named `ast.py` is not the stdlib's,
+    so the frame's path must sit under a noise root.
+
+    One trap worth recording, because it hides the bug from a casual check: the
+    event only fires when the frame's source is a real file on disk. Under
+    ``python -c`` there is no segment for `linecache` to fetch, `ast.parse` is
+    never reached, and no event is raised. A REPL or ``-c`` reproduction
+    therefore "disproves" a defect that is entirely real in a `.py` file.
+    """
+    if len(args) < 2 or args[1] != _PEP657_FILENAME:
+        return False
+    try:
+        frame = sys._getframe(1)
+    except Exception:
+        return False
+    depth = 0
+    while frame is not None and depth < _FRAME_SCAN_LIMIT:
+        name = frame.f_code.co_filename
+        if os.path.basename(name) in _TRACEBACK_RENDERERS:
+            try:
+                path = os.path.normcase(os.path.abspath(name))
+            except Exception:
+                return False
+            if any(path.startswith(root) for root in _NOISE_ROOTS):
+                return True
+        frame = frame.f_back
+        depth += 1
+    return False
+
+
 def _in_import_machinery() -> bool:
     """True when the current call is being made *by* an import.
 
@@ -405,6 +475,8 @@ def _hook(event: str, args: tuple) -> None:
         elif event == "compile":
             if len(args) > 1 and _is_poc(args[1]):
                 return                     # runpy compiling the PoC itself
+            if _is_traceback_caret_compile(args):
+                return                     # PEP-657 caret rendering, not the target
         elif event == "exec":
             code = args[0] if args else None
             if _is_poc(getattr(code, "co_filename", None)):

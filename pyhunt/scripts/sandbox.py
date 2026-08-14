@@ -1028,7 +1028,37 @@ def up(repo: Path, results_dir: Path, *, build_image: bool = True,
         f"--results-dir {results_dir}` before trusting it"
     )
     merge_preflight(results_dir, state)
+    _record_image_in_manifest(results_dir, state["target_image"])
     return state
+
+
+def _record_image_in_manifest(results_dir, target_image: dict) -> None:
+    """Copy the provisioned image tag into `manifest.json:image`.
+
+    `replay.py:resolve_image` reads the manifest and nothing else, and correctly
+    refuses to guess: an unresolvable image is `not_attempted`, never a run
+    against a bare `python:slim`. But `up` recorded the tag only in
+    `preflight.json.sandbox.target_image`, so the two never met. A Proof-mode
+    run with a verified boundary and a fully provisioned image replayed 33
+    findings as `not_attempted` for want of one key — a silent, total downgrade
+    that reads in the report exactly like an environment that was never there.
+    """
+    tag = (target_image or {}).get("image")
+    if not tag:
+        return
+    manifest = Path(results_dir) / "manifest.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if data.get("image") == tag:
+        return
+    data["image"] = tag
+    data.setdefault("image_source", "sandbox.py up")
+    try:
+        manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError:  # pragma: no cover - best effort
+        pass
 
 
 # ===========================================================================

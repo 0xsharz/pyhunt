@@ -1,112 +1,187 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "ReconOutput",
-  "description": "Architecture map + initial hunt task queue.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "phase 1 recon output (inputs.json)",
+  "description": "The artifact `phase1_recon.md` Step 4 mandates. Regenerated from that contract after a real run found the two had drifted apart: this schema still described the deleted orchestrator's recon payload, requiring `subsystems` and `initial_tasks`, forbidding the four top-level keys the phase file requires (`run_id`, `target`, `frameworks`, `history`) under `additionalProperties: false`, and keying `inputs[]` on `id` where every consumer reads `input_id` (`coverage._input_id` prefers it; `specialists._has_authz_surface` reads `architecture.*`). The phase 1 agent could not validate its own output and had to choose which of two contradictory contracts was real. A schema nothing is ever validated against does not document a contract, it competes with one \u2014 so `tests/test_h2_run_defects.py` now round-trips a real artifact through this file.",
   "type": "object",
-  "required": ["subsystems", "architecture", "initial_tasks"],
-  "additionalProperties": false,
+  "oneOf": [
+    {
+      "title": "legacy orchestrator recon payload",
+      "description": "The shape the deleted CLI orchestrator emitted. Still exercised by tests/test_schemas.py and tests/test_design_controls.py, so it is kept as an explicit variant rather than quietly broken. Identified by carrying `subsystems`.",
+      "required": [
+        "subsystems",
+        "architecture",
+        "initial_tasks"
+      ]
+    },
+    {
+      "title": "phase 1 recon artifact (inputs.json)",
+      "description": "What phase1_recon.md Step 4 actually mandates. Carries no `subsystems`, and task generation belongs to phase 1b, so `initial_tasks` is absent too.",
+      "required": [
+        "inputs"
+      ],
+      "not": {
+        "required": [
+          "subsystems"
+        ]
+      }
+    }
+  ],
+  "additionalProperties": true,
   "properties": {
-    "subsystems": {
+    "run_id": {
+      "type": "string"
+    },
+    "target": {
+      "type": "string"
+    },
+    "target_scope": {
+      "type": "string",
+      "description": "Subtree the operator scoped the run to, e.g. 'src/h2'. Written here by phase 0/1 and honoured by taint.py."
+    },
+    "scope_note": {
+      "type": "string"
+    },
+    "framework_note": {
+      "type": "string"
+    },
+    "frameworks": {
       "type": "array",
-      "minItems": 1,
+      "description": "Detected frameworks. Either bare names, or the graded records recon_enumerate.py emits ({framework, confidence, evidence}). Both spellings occur in real artifacts and both are accepted; requiring only the graded form is part of what made the previous revision unusable.",
+      "items": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "framework": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "string"
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "history": {
+      "type": "array",
+      "description": "Security patches mined from the target's own git history. An empty array is a real result and must be reported as a coverage gap rather than as an absence of history \u2014 the miner is keyed to the injection sink tables and is blind to a target whose defect history is bounds and state machines.",
       "items": {
         "type": "object",
-        "required": ["name", "path", "language", "purpose"],
-        "additionalProperties": false,
+        "additionalProperties": true
+      }
+    },
+    "design_controls": {
+      "type": "array",
+      "description": "Defences recon observed, so a hunter can argue past them rather than rediscover them. Item shape is enforced: a control missing its kind, location or description cannot be checked by anyone downstream.",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "location",
+          "description"
+        ],
+        "additionalProperties": true,
         "properties": {
-          "name": { "type": "string" },
-          "path": { "type": "string", "description": "Repo-relative directory or file." },
-          "language": { "type": "string" },
-          "purpose": { "type": "string" },
-          "external_dependencies": { "type": "array", "items": { "type": "string" } }
+          "kind": {
+            "type": "string"
+          },
+          "location": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          }
         }
       }
     },
     "architecture": {
       "type": "object",
-      "required": ["build_commands", "entry_points", "trust_boundaries"],
-      "additionalProperties": false,
-      "properties": {
-        "build_commands": { "type": "array", "items": { "type": "string" } },
-        "test_commands":  { "type": "array", "items": { "type": "string" } },
-        "entry_points": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["kind", "location"],
-            "additionalProperties": false,
-            "properties": {
-              "kind": { "type": "string", "description": "http_route|cli|rpc|grpc|message_queue|cron|library_api|webhook|file_input" },
-              "location": { "type": "string", "description": "file:line or symbol reference" },
-              "auth_required": { "type": "boolean" },
-              "notes": { "type": "string" }
-            }
-          }
-        },
-        "trust_boundaries": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["name", "description"],
-            "additionalProperties": false,
-            "properties": {
-              "name": { "type": "string" },
-              "description": { "type": "string" },
-              "source_zone": { "type": "string" },
-              "sink_zone": { "type": "string" }
-            }
-          }
-        },
-        "external_inputs": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["name", "kind"],
-            "additionalProperties": false,
-            "properties": {
-              "name": { "type": "string" },
-              "kind": { "type": "string", "description": "http_param|http_header|http_body|env_var|file|cli_arg|stdin|db_field|broker_message" },
-              "controllable_by": { "type": "string", "description": "anonymous_user|authenticated_user|admin|internal_service" }
-            }
-          }
-        }
-      }
+      "description": "Entry points and trust boundaries. `specialists.py` gates its access-control and batch-ETL sweeps on this being populated, so an empty object silently disables them.",
+      "additionalProperties": true
     },
     "inputs": {
       "type": "array",
-      "description": "Attacker-controllable input inventory — every place external data enters. Optional so pre-F1 recon outputs still validate; when present it drives the completeness ledger (every input is reconciled to a disposition).",
       "items": {
         "type": "object",
-        "required": ["id", "source_type", "location", "variable", "entry_point", "trust_level"],
-        "additionalProperties": false,
+        "required": [
+          "source_type",
+          "location",
+          "trust_level"
+        ],
+        "additionalProperties": true,
         "properties": {
-          "id": { "type": "string", "description": "Stable unique id for this input (e.g. in_1)." },
-          "source_type": { "type": "string", "description": "HTTP param|header|body field|cookie|CLI arg|env var|queue message|file upload|deserialized input|DB read|etc." },
-          "location": { "type": "string", "description": "file:line where the input enters the codebase." },
-          "variable": { "type": "string", "description": "What the input is bound to in code (use N/A for no-input endpoints)." },
-          "entry_point": { "type": "string", "description": "Route, CLI command, queue consumer, gRPC method, or other entry point that receives it." },
-          "trust_level": { "type": "string", "enum": ["unauthenticated", "authenticated", "internal", "privileged"] }
-        }
+          "input_id": {
+            "type": "string",
+            "description": "Stable id. Preferred by every consumer; `id` is accepted as a legacy alias."
+          },
+          "id": {
+            "type": "string"
+          },
+          "source_type": {
+            "type": "string"
+          },
+          "location": {
+            "type": "string",
+            "description": "`file:line` that was actually opened."
+          },
+          "variable": {
+            "type": "string"
+          },
+          "entry_point": {
+            "type": "string"
+          },
+          "trust_level": {
+            "type": "string",
+            "enum": [
+              "unauthenticated",
+              "authenticated",
+              "privileged",
+              "internal"
+            ]
+          },
+          "notes": {
+            "type": "string"
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "input_id"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          }
+        ]
+      }
+    },
+    "subsystems": {
+      "type": "array",
+      "description": "Optional. Required by the previous revision of this schema; no phase writes it.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
       }
     },
     "initial_tasks": {
       "type": "array",
-      "minItems": 1,
-      "items": { "$ref": "hunt_task.schema.json" }
-    },
-    "design_controls": {
-      "type": "array",
-      "description": "Security controls the codebase employs. Optional so pre-V5 recon still validates. Injected downstream as HINTS to verify empirically — never as trusted exclusions.",
+      "description": "Optional. Task generation is phase 1b's job (`tasks.json`), not phase 1's.",
       "items": {
         "type": "object",
-        "required": ["kind", "location", "description"],
-        "additionalProperties": false,
-        "properties": {
-          "kind": { "type": "string", "description": "auth|input_validation|output_encoding|csrf|rate_limit|access_control|sanitizer|crypto|other" },
-          "location": { "type": "string", "description": "file:line or subsystem where the control is implemented." },
-          "description": { "type": "string" },
-          "applies_to": { "type": "string", "description": "Optional: which entry points/subsystems/paths this control guards." }
-        }
+        "additionalProperties": true
       }
     }
   }

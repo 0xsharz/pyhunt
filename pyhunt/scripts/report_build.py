@@ -64,7 +64,10 @@ from pathlib import Path
 from typing import Any
 
 import findings_io
+from cvss import rating as cvss_rating
+from cvss import score as cvss_base_score
 from json_utils import validate_schema
+from validate_gates import severity_from_cvss_rating
 from oracle import classes as vuln_classes
 from oracle.markers import MARKER as OBSERVER_MARKER
 from redact import redact_json
@@ -977,10 +980,28 @@ def attach_cvss(payload: dict, verifications: dict[str, dict],
         verification = verifications.get(entry["finding_id"]) or {}
         vector = verification.get("cvss_vector")
         score = verification.get("cvss_score")
+        # The score is computed here when the verifier supplied only a vector,
+        # which is the normal case: `phase2c_verify.md` asks the verifier for a
+        # vector and forbids it the arithmetic, and nothing between there and
+        # here ran `validate_gates.apply_cvss`. Requiring BOTH fields meant the
+        # assessed vector was silently discarded and a severity-keyed baseline
+        # floor stood in for it — on the recorded h2 run, all 18 delivered
+        # findings rendered the identical `AV:L/.../UI:R` 4.4, describing a
+        # remotely reachable HTTP/2 protocol defect as local and
+        # user-interaction-gated. A wrong number carrying the same authority as
+        # a right one is the exact failure `cvss.py` exists to prevent.
+        if vector and score is None:
+            score = cvss_base_score(vector)
         if vector and score is not None:
+            band = severity_from_cvss_rating(cvss_rating(score))
             entry["cvss"] = {
                 "score": score,
-                "severity": entry.get("severity"),
+                # The CVSS band, not the finding's recorded severity. Where the
+                # two differ the report shows both rather than reconciling them
+                # silently: the recorded severity is what phase 2 filed and
+                # phase 3 ranked on, and the band is what the verifier's own
+                # vector computes to.
+                "severity": band or entry.get("severity"),
                 "vector": vector,
             }
             continue
@@ -1294,6 +1315,191 @@ def structural_summary(findings: list[dict]) -> dict:
     }
 
 
+def _oracle_conflicts(findings: list[dict], verifications: dict[str, dict]) -> dict:
+    """Where the two oracles and the adversarial verifier disagree, by name.
+
+    Three oracles run over the same finding — the execution gate, the
+    structural probe, and a second model re-reading the source — and the
+    report is only worth its denominators if it says when they contradicted
+    each other rather than printing whichever one it reached last.
+
+    * ``demonstrated_but_rejected`` is the case that keeps ``demonstrated``
+      honest. A probe can hold on a predicate that is true and still be about a
+      defect no attacker can reach: on the recorded h2 run,
+      ``WindowManager.window_opened``'s check-before-mutate ordering bug was
+      demonstrated in 2/2 runs and then rejected in 2c because no call site
+      carries an attacker-supplied value. Both facts are true and the second is
+      the one that decides whether to fix it today.
+    * ``refuted_but_confirmed`` is the reverse, and it is a claim about the
+      tool: the verifier read the probe's own carrier path and showed the
+      "transform" was a content-preserving encode. A refutation that is
+      overturned must be printed as an overturned refutation, not deleted.
+    * ``proven_but_rejected`` outranks the verifier and is delivered anyway
+      (``select_delivered``), so it is disclosed rather than silently resolved.
+    """
+    demonstrated_but_rejected: list[str] = []
+    refuted_but_confirmed: list[str] = []
+    proven_but_rejected: list[str] = []
+    for finding in findings:
+        finding_id = str(finding.get("finding_id") or "")
+        verdict = (verifications.get(finding_id) or {}).get("verdict")
+        structural = finding.get("structural") or {}
+        outcome = str(structural.get("outcome") or "")
+        if outcome == "demonstrated" and verdict == "rejected":
+            demonstrated_but_rejected.append(finding_id)
+        if outcome == "refuted" and verdict == "confirmed":
+            refuted_but_confirmed.append(finding_id)
+        if findings_io.poc_succeeded(finding) and verdict == "rejected":
+            proven_but_rejected.append(finding_id)
+    conflicts: dict[str, Any] = {}
+    if demonstrated_but_rejected:
+        conflicts["demonstrated_but_rejected"] = sorted(demonstrated_but_rejected)
+    if refuted_but_confirmed:
+        conflicts["refuted_but_confirmed"] = sorted(refuted_but_confirmed)
+    if proven_but_rejected:
+        conflicts["proven_but_rejected"] = sorted(proven_but_rejected)
+    return conflicts
+
+
+#: The frame-walk signature of a `self_attributed` verdict that is a harness
+#: artefact rather than a PoC that cheated. On CPython >= 3.11
+#: `traceback.print_exc()` renders PEP-657 carets, which calls `ast.parse` on
+#: the offending source segment and raises a watched `compile` event from the
+#: PoC's own frame. The PoC never called `compile`; it printed a traceback.
+_PEP657_MARKER = "audit:compile"
+
+
+def _self_attribution_artefacts(findings: list[dict]) -> dict:
+    """`self_attributed` verdicts whose only events are PEP-657 caret renders.
+
+    The gate's word for this outcome is "the PoC reached the sink directly and
+    did not exercise the target's path", which is the right reading of a PoC
+    that cheated and the wrong reading of a PoC that printed a traceback. The
+    distinction is checkable: an artefact's attributed-event list is entirely
+    `compile` events and nothing was attributed to the target, so the verdict
+    should be read as `no_event`. Counted and named here rather than left for a
+    reader to infer from four identical-looking rows.
+    """
+    ids: list[str] = []
+    for finding in findings:
+        execution = finding.get("execution") or {}
+        if str(execution.get("outcome") or "") != "self_attributed":
+            continue
+        evidence = [str(line) for line in (execution.get("evidence") or [])]
+        if not evidence:
+            continue
+        if all(_PEP657_MARKER in line for line in evidence) and not int(
+            execution.get("events_attributed") or 0
+        ):
+            ids.append(str(finding.get("finding_id") or ""))
+    if not ids:
+        return {}
+    return {
+        "count": len(ids),
+        "finding_ids": sorted(ids),
+        "note": (
+            "Every runtime event these PoCs produced is a `compile` event "
+            "raised from the PoC's own frame, and none was attributed to the "
+            "target. That is the signature of PEP-657 caret rendering: on "
+            "CPython 3.11+ `traceback.print_exc()` calls `ast.parse` on the "
+            "offending source segment, which raises a watched `compile` event "
+            "the observer's frame walk credits to the PoC. The PoC never "
+            "called `compile`; it printed a traceback. Read these as "
+            "`no_event` — a defect in PyHunt's observer, not a PoC that "
+            "bypassed the code under test."
+        ),
+    }
+
+
+def _sites_led_by_a_rejected_finding(
+    findings: list[dict], verifications: dict[str, dict]
+) -> dict:
+    """Dedupe groups whose canonical record the verifier rejected.
+
+    `dedupe.py` now prefers a deliverable sibling for the canonical slot, so a
+    group in this list is one where EVERY member was rejected — the site is
+    rendered by a rejected record or not at all, and a reader should be able to
+    count those without opening `verify/`. Before that fix the list also caught
+    groups where a confirmed finding was hidden behind a rejected canonical and
+    withheld twice, which is how `settings.py:162-174` went missing.
+    """
+    groups: dict[str, list[dict]] = {}
+    for finding in findings:
+        group_id = str(finding.get("group_id") or "")
+        if group_id:
+            groups.setdefault(group_id, []).append(finding)
+    rows: list[dict] = []
+    for group_id, members in sorted(groups.items()):
+        canonical = next((m for m in members if m.get("is_canonical")), None)
+        if canonical is None:
+            continue
+        finding_id = str(canonical.get("finding_id") or "")
+        if (verifications.get(finding_id) or {}).get("verdict") != "rejected":
+            continue
+        rows.append({
+            "group_id": group_id,
+            "canonical": finding_id,
+            "file": canonical.get("file"),
+            "line_start": canonical.get("line_start"),
+            "members": len(members),
+            "confirmed_members": sum(
+                1 for m in members
+                if (verifications.get(str(m.get("finding_id") or "")) or {}).get(
+                    "verdict") == "confirmed"
+            ),
+        })
+    if not rows:
+        return {}
+    return {
+        "count": len(rows),
+        "with_a_confirmed_member_hidden": sum(
+            1 for r in rows if r["confirmed_members"]),
+        "sites": rows,
+        "note": (
+            "Sites whose canonical record the adversarial verifier rejected. "
+            "The whole group is withheld from the delivered set, which is "
+            "correct only when no member survived verification — so "
+            "`with_a_confirmed_member_hidden` must read 0. A non-zero value "
+            "means a confirmed finding was withheld twice, once as rejected "
+            "and once as a duplicate of the rejected record."
+        ),
+    }
+
+
+def _run_context(manifest: dict) -> dict:
+    """The header facts `phase4_report.md` prescribes, straight from the manifest.
+
+    Mode, achieved isolation tier, scan date, the target's commit, and the
+    model each phase ran as. The last one is the reason this function exists:
+    "Model transparency" is a required section of the phase file — the pin that
+    used to enforce model diversity mechanically is gone, and printing
+    `model_used` per phase is the only thing left that makes a same-model
+    verification visible. Nothing rendered it, so it was invisible on every
+    run, including the runs where it would have mattered.
+
+    Everything here is copied, never derived: a report that computes its own
+    idea of which model ran is a report that can disagree with the manifest.
+    """
+    vcs = manifest.get("target_vcs") if isinstance(manifest.get("target_vcs"), dict) else {}
+    context: dict[str, Any] = {}
+    for key in ("mode", "isolation_tier", "isolation_verified", "target_scope",
+                "started_at", "finished_at", "authorisation"):
+        if manifest.get(key) not in (None, ""):
+            context[key] = manifest[key]
+    for key in ("repo", "tag", "commit"):
+        if vcs.get(key):
+            context[f"target_{key}"] = vcs[key]
+    if isinstance(manifest.get("model_used"), dict):
+        context["models"] = dict(manifest["model_used"])
+    deviations = manifest.get("harness_deviations")
+    if isinstance(deviations, list) and deviations:
+        context["harness_deviations"] = len(deviations)
+    phases = manifest.get("phases_completed")
+    if isinstance(phases, list) and phases:
+        context["phases_completed"] = list(phases)
+    return context
+
+
 def attach_coverage(payload: dict, run: dict, withheld: list[dict]) -> None:
     """Attach the consolidated coverage disclosure.
 
@@ -1401,7 +1607,46 @@ def attach_coverage(payload: dict, run: dict, withheld: list[dict]) -> None:
             reasons[reason] = reasons.get(reason, 0) + 1
         coverage["findings_withheld"] = reasons
 
+    # The uncovered inputs BY NAME, not just as a count. `phase4_report.md`
+    # disclosure 3 asks for "the uncovered ones listed by location and reason";
+    # `report.json` carried them inside `input_inventory` and `report.md`
+    # rendered only the integer, so the one number that names a gap arrived
+    # with the gap itself stripped out. A reader of the advisory could see that
+    # seven inputs were missed and had no way to learn which.
+    inputs_by_id = {
+        str(row.get("input_id") or row.get("id")): row
+        for row in ((run.get("inputs") or {}).get("inputs") or [])
+    }
+    uncovered_rows = []
+    for row in inputs:
+        if row.get("disposition") == "covered":
+            continue
+        input_id = str(row.get("input_id") or row.get("id") or "")
+        source = inputs_by_id.get(input_id, {})
+        uncovered_rows.append({
+            "id": input_id,
+            "disposition": row.get("disposition") or "unreconciled",
+            "location": source.get("location"),
+            "entry_point": source.get("entry_point"),
+            "trust_level": source.get("trust_level"),
+            "source_type": source.get("source_type"),
+            "reason": row.get("evidence") or row.get("disposition_evidence"),
+            "note": source.get("notes"),
+        })
+    if uncovered_rows:
+        coverage["uncovered_inputs"] = uncovered_rows
+
+    coverage["run_context"] = _run_context(run.get("manifest") or {})
     coverage["execution"] = execution_summary(findings, run.get("manifest") or {})
+    conflicts = _oracle_conflicts(findings, verifications)
+    if conflicts:
+        coverage["execution"]["oracle_conflicts"] = conflicts
+    artefact = _self_attribution_artefacts(findings)
+    if artefact:
+        coverage["execution"]["self_attribution_artefacts"] = artefact
+    rejected_canonicals = _sites_led_by_a_rejected_finding(findings, verifications)
+    if rejected_canonicals:
+        coverage["sites_canonicalised_by_a_rejected_finding"] = rejected_canonicals
 
     coverage["coverage_complete"] = bool(
         coverage.get("catchall_dropped", 0) == 0

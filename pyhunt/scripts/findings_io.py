@@ -396,6 +396,12 @@ def check_class_consistency(results_dir: str | Path) -> list[dict]:
                 "file": finding.get("file"),
                 "vuln_class": finding.get("vuln_class"),
                 "cwe": finding.get("cwe"),
+                # `refinement` (the CWE is more specific than the class allows)
+                # or `conflict` (the two name unrelated weaknesses). Reported
+                # per row so a reader can sort: on a real run 34 refinements
+                # hid the single conflict, and a 74% flag rate is no signal.
+                "kind": taxonomy.disagreement_kind(
+                    finding.get("vuln_class"), finding.get("cwe")),
                 "problems": problems,
             })
     return out
@@ -624,16 +630,66 @@ def _safe_id(finding_id: str) -> str:
 
 
 def write_finding(results_dir: str | Path, finding: dict) -> Path:
-    """Persist a finding record verbatim. No gating, no validation.
+    """Persist a finding record, **inside its envelope**. No gating, no validation.
 
     The raw persist, used when something other than the hunt is updating an
     existing record — a severity re-derived from CVSS, a dedupe group
     assignment. :func:`record_finding` is the one that attaches the placeholder
     execution block; :func:`apply_proof` is the one that can promote.
+
+    **This used to write the bare finding dict, and that silently broke the
+    contract every other phase validates against.** `finding.schema.json`
+    requires `task_id`, `findings`, `gaps_observed` and `files_read` with
+    `additionalProperties: false`; a bare finding satisfies none of it. Phase 2
+    exploded 273 findings into correct envelopes, phase 2b's `apply-proofs` and
+    `apply-structural` then rewrote 242 of them here, and every one of those
+    stopped validating — the h2 run's N4 exactly ("every finding in the run fails
+    its own schema, so the validator carries no signal at all"), reintroduced by
+    the writer rather than by the schema.
+
+    Nothing downstream crashed, because :func:`load_findings` reads both shapes.
+    That is precisely what made it invisible: the only casualty was the check
+    that would have caught the next real malformation.
+
+    So the envelope is preserved when the file already has one, and built when it
+    does not. The finding is replaced by `finding_id` inside `findings[]`, and
+    the sibling keys — `task_id`, `gaps_observed`, `files_read` — are carried
+    forward untouched, because they belong to the hunt unit and not to this
+    update.
     """
     finding = dict(finding)
     finding["recorded_at"] = _now()
-    return _write_json(finding_path(results_dir, finding["finding_id"]), finding)
+    path = finding_path(results_dir, finding["finding_id"])
+
+    existing = _read_json(path, default=None)
+    if isinstance(existing, dict) and isinstance(existing.get("findings"), list):
+        payload = dict(existing)
+        replaced = False
+        merged = []
+        for item in payload["findings"]:
+            if isinstance(item, dict) and item.get("finding_id") == finding["finding_id"]:
+                merged.append(finding)
+                replaced = True
+            else:
+                merged.append(item)
+        if not replaced:
+            merged.append(finding)
+        payload["findings"] = merged
+    else:
+        # No envelope on disk — either a first write, or a file left bare by the
+        # behaviour this docstring describes. Rebuild it around whatever the old
+        # record knew, rather than inventing values.
+        prior = existing if isinstance(existing, dict) else {}
+        payload = {
+            "task_id": prior.get("task_id") or finding.get("task_id") or "unknown",
+            "findings": [finding],
+            "gaps_observed": prior.get("gaps_observed") or [],
+            "files_read": prior.get("files_read") or [],
+        }
+    payload.setdefault("task_id", "unknown")
+    payload.setdefault("gaps_observed", [])
+    payload.setdefault("files_read", [])
+    return _write_json(path, payload)
 
 
 def record_finding(
@@ -1061,13 +1117,29 @@ def _cmd_class_repair(args: argparse.Namespace) -> int:
 def _cmd_class_check(args: argparse.Namespace) -> int:
     """Advisory, never fatal. A mislabelled finding is still a real finding."""
     problems = check_class_consistency(args.results_dir)
-    print(json.dumps({"inconsistent": len(problems), "findings": problems},
-                     indent=2))
-    if problems:
-        print(f"{len(problems)} finding(s) carry a class that disagrees with "
-              "their own CWE. This corrupts routing, dedupe grouping and every "
-              "CWE-keyed consumer downstream — fix the labels before phase 4.",
+    by_kind: dict[str, int] = {}
+    for row in problems:
+        key = str(row.get("kind") or "unknown")
+        by_kind[key] = by_kind.get(key, 0) + 1
+    conflicts = [r["finding_id"] for r in problems if r.get("kind") == "conflict"]
+    print(json.dumps({
+        "inconsistent": len(problems),
+        "by_kind": by_kind,
+        "conflicts": conflicts,
+        "findings": problems,
+    }, indent=2))
+    if conflicts:
+        print(f"{len(conflicts)} finding(s) carry a CWE that names an unrelated "
+              f"weakness to their class: {', '.join(conflicts)}. Read these — "
+              "one of the two labels is simply wrong, and routing, dedupe "
+              "grouping and every CWE-keyed consumer downstream key on it.",
               file=sys.stderr)
+    refinements = by_kind.get("refinement", 0)
+    if refinements:
+        print(f"{refinements} further finding(s) carry a CWE more specific than "
+              "their class allows. That is a labelling refinement, not evidence "
+              "against the finding; repair with `class-repair` if you want the "
+              "labels to match.", file=sys.stderr)
     return 0
 
 

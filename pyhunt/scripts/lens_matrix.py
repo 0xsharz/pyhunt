@@ -90,9 +90,50 @@ def lenses_touching(path: str) -> list[str]:
                   if any(signal in lowered for signal in signals))
 
 
+def _gap_key(gap: dict) -> tuple:
+    """Identity for one gap entry, for deduplication across sources.
+
+    Deliberately ignores the bookkeeping keys the orchestrator stamps on
+    (`_unit`, `_task`), so the same observation read from `gaps.json` and from
+    the per-unit file it was concatenated from collapses to one.
+    """
+    return tuple(sorted(
+        (k, json.dumps(v, sort_keys=True, default=str))
+        for k, v in gap.items() if not k.startswith("_")
+    ))
+
+
 def load_gaps(results_dir: Path) -> list[dict]:
-    """Every `gaps_observed` entry the run recorded, from either location."""
+    """Every `gaps_observed` entry the run recorded, from either location.
+
+    Deduplicated, because the two locations overlap by construction: the
+    orchestrator concatenates the per-unit files into `gaps.json`, and this
+    function then reads both. Every entry was therefore counted twice, and the
+    reported totals were exactly 2x — a real run printed `gaps_seen: 356 /
+    dismissals: 116` where `gaps.json` held 178 entries carrying 58 dismissals.
+
+    What comes back now is **distinct** gaps: 162 and 54 on that same run. The
+    remaining difference from 178/58 is genuine duplication *within* the run —
+    two hunt units recording the same observation. Collapsing those is the right
+    call for a "what surfaces were dismissed" count, which is what the lens
+    matrix consumes, but it does mean this is not a tally of observations made.
+
+    Task emission was never affected (it dedupes downstream), but the doubled
+    numbers reached the report, and a 2x coverage statistic is the kind of error
+    a reader has no way to catch.
+    """
     out: list[dict] = []
+    seen: set[tuple] = set()
+
+    def _add(entries) -> None:
+        for gap in entries:
+            if not isinstance(gap, dict):
+                continue
+            key = _gap_key(gap)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(gap)
     for candidate in (results_dir / "logs" / "hunt" / "gaps.json",
                       results_dir / "gaps.json"):
         if not candidate.is_file():
@@ -102,9 +143,9 @@ def load_gaps(results_dir: Path) -> list[dict]:
         except (OSError, ValueError):
             continue
         if isinstance(payload, list):
-            out.extend(g for g in payload if isinstance(g, dict))
+            _add(payload)
         elif isinstance(payload, dict) and isinstance(payload.get("gaps"), list):
-            out.extend(g for g in payload["gaps"] if isinstance(g, dict))
+            _add(payload["gaps"])
 
     # Hunt outputs also carry gaps inline; a run whose collector never
     # concatenated them would otherwise look like it had no dismissals at all.
@@ -119,8 +160,7 @@ def load_gaps(results_dir: Path) -> list[dict]:
                 continue
             for doc in (payload if isinstance(payload, list) else [payload]):
                 if isinstance(doc, dict):
-                    out.extend(g for g in (doc.get("gaps_observed") or [])
-                               if isinstance(g, dict))
+                    _add(doc.get("gaps_observed") or [])
     return out
 
 

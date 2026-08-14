@@ -45,7 +45,8 @@ OBSERVER_DIR = Path(__file__).resolve().parent / "observers"
 # Every marker line an observer prints starts with this, so a single grep
 # separates instrumentation output from the PoC's own chatter.
 from oracle.markers import MARKER  # single definition, shared with the gate
-from oracle.nonce import canary_path, nonce_for
+from oracle.nonce import (canary_path, ensure_durable_secret,
+                          nonce_for, secret_is_durable)
 
 # Appended to every Observer.notes. The wording is deliberately blunt: this is
 # the one inference that would turn optional instrumentation into a source of
@@ -280,7 +281,8 @@ def poc_execution_block(languages: list[str], project_env: dict | None,
                         materialize: bool = False,
                         nonce: str | None = None,
                         run_id: str | None = None,
-                        task_id: str | None = None) -> dict | None:
+                        task_id: str | None = None,
+                        results_dir: Path | str | None = None) -> dict | None:
     """The per-task PoC recipe injected into the Hunt agent's `user_input`.
 
     Returns None when no Runtime matches — Hunt then falls back to its existing
@@ -302,6 +304,13 @@ def poc_execution_block(languages: list[str], project_env: dict | None,
     noticed and said so unprompted. So now: pass a nonce, or pass
     ``run_id``/``task_id`` and one is minted here via
     :func:`oracle.nonce.nonce_for`; pass neither and this raises.
+
+    **A nonce keyed to an unpersisted secret is not producible either.** Minting
+    from ``run_id``/``task_id`` requires the secret to survive this process,
+    because the phase that verifies the proof is a different one. Pass
+    ``results_dir=`` and the secret is written to ``.run_secret``; otherwise
+    ``PYHUNT_RUN_SECRET`` must already be set. Neither, and this raises rather
+    than handing back a well-formed nonce that replay can never reproduce.
     """
     rt = runtime_for(languages, project_env)
     if rt is None:
@@ -309,6 +318,21 @@ def poc_execution_block(languages: list[str], project_env: dict | None,
 
     if not nonce:
         if run_id and task_id:
+            if results_dir is not None:
+                ensure_durable_secret(results_dir)
+            elif not secret_is_durable():
+                raise ValueError(
+                    "poc_execution_block was asked to mint a nonce from "
+                    f"run_id={run_id!r}/task_id={task_id!r}, but the run secret "
+                    "that keys it exists nowhere outside this process: "
+                    "PYHUNT_RUN_SECRET is unset and no `results_dir=` was given "
+                    "to persist a new one. The nonce would look correct and be "
+                    "unreproducible — replay would derive a different value, "
+                    "match nothing, and report `sink_reached_unproven` with no "
+                    "indication why. Pass `results_dir=` so the secret is "
+                    "written to `.run_secret`, or export PYHUNT_RUN_SECRET / set "
+                    "manifest.json:run_secret before dispatching."
+                )
             nonce = nonce_for(run_id, task_id)
         else:
             raise ValueError(

@@ -186,7 +186,17 @@ _MISSING_PATH_RE = re.compile(
 
 def _fix_missing_copy(dockerfile: str, log: str) -> tuple[str, str] | None:
     """A COPY names a path that is not in the build context. Drop that COPY
-    (never the whole-repo `COPY . <dst>`, which is the context itself)."""
+    (never the whole-repo `COPY . <dst>`, which is the context itself), and
+    neutralise whatever *consumed* it.
+
+    Dropping the COPY alone is not a repair. A pip-tools layout ships
+    `requirements/base.in` and generates `requirements/base.txt`, so a
+    vendored Dockerfile carries both `COPY ./requirements/base.txt` and
+    `pip install -r requirements/base.txt`. Removing the COPY leaves the
+    install reading a file that is now guaranteed absent, so the next attempt
+    fails for the same missing path one instruction later and the ladder burns
+    an attempt discovering that. Every `&&`-segment naming the dropped path
+    becomes `true`."""
     m = _MISSING_PATH_RE.search(log)
     if not m:
         return None
@@ -203,7 +213,59 @@ def _fix_missing_copy(dockerfile: str, log: str) -> tuple[str, str] | None:
         kept.append(ln)
     if not dropped:
         return None
-    return _join(kept), f"dropped COPY of missing context path {missing!r}"
+    kept, neutralised = _neutralise_consumers(kept, base)
+    note = f"dropped COPY of missing context path {missing!r}"
+    if neutralised:
+        note += (f"; neutralised {neutralised} command segment(s) that read it "
+                 "— they would have failed on the same missing path")
+    return _join(kept), note
+
+
+def _instruction_spans(lines: list[str]) -> list[tuple[int, int]]:
+    """Inclusive (start, end) index pairs, one per *logical* Dockerfile
+    instruction. A physical line ending in a backslash continues onto the
+    next one, so `RUN a \\\\\\n && b` is one instruction spanning two lines."""
+    spans: list[tuple[int, int]] = []
+    i, n = 0, len(lines)
+    while i < n:
+        start = i
+        while i < n - 1 and lines[i].rstrip().endswith("\\"):
+            i += 1
+        spans.append((start, i))
+        i += 1
+    return spans
+
+
+def _neutralise_consumers(lines: list[str], base: str) -> tuple[list[str], int]:
+    """Replace every `&&`-joined shell segment inside a RUN that names `base`
+    with `true`, preserving indentation and line continuations."""
+    if not base:
+        return lines, 0
+    out = list(lines)
+    count = 0
+    for start, end in _instruction_spans(out):
+        if not re.match(r"\s*RUN\s", out[start], re.I):
+            continue
+        for i in range(start, end + 1):
+            raw = out[i]
+            body, cont = (raw[:-1], "\\") if raw.rstrip().endswith("\\") else (raw, "")
+            if base not in body:
+                continue
+            trailing_ws = body[len(body.rstrip()):] if cont else ""
+            segments = re.split(r"(\s*&&\s*|\s*;\s*)", body.rstrip())
+            changed = False
+            for j in range(0, len(segments), 2):
+                seg = segments[j]
+                if base in seg:
+                    lead = seg[: len(seg) - len(seg.lstrip())]
+                    # keep a leading `RUN ` so the instruction stays valid
+                    kw = re.match(r"(\s*RUN\s+)", seg, re.I)
+                    segments[j] = (kw.group(1) if kw else lead) + "true"
+                    changed = True
+            if changed:
+                count += 1
+                out[i] = "".join(segments) + trailing_ws + cont
+    return out, count
 
 
 def _soften_install(dockerfile: str, log: str) -> tuple[str, str] | None:
@@ -211,16 +273,28 @@ def _soften_install(dockerfile: str, log: str) -> tuple[str, str] | None:
 
     A partially-provisioned image still gives a PoC a real interpreter/runtime
     and the target's source — strictly better than no image. The caller
-    surfaces the returned note so this is never a silent degradation."""
+    surfaces the returned note so this is never a silent degradation.
+
+    The suffix goes at the end of the *logical* instruction. Appending it to
+    the first physical line of a continued `RUN a \\` produced
+    `RUN a \\ || true`, which terminates the continuation and makes the next
+    line parse as its own instruction — `unknown instruction: &&`. The repair
+    of last resort then broke every Dockerfile it was applied to, so a target
+    whose build merely needed softening got no image at all."""
     lines = _lines(dockerfile)
-    for i, ln in enumerate(lines):
-        if re.match(r"\s*RUN\s", ln, re.I) and not ln.rstrip().endswith("|| true"):
-            lines[i] = ln.rstrip() + " || true"
-            return (
-                _join(lines),
-                "dependency install made non-fatal — the image may be "
-                "INCOMPLETE (some dependencies are missing)",
-            )
+    for start, end in _instruction_spans(lines):
+        if not re.match(r"\s*RUN\s", lines[start], re.I):
+            continue
+        last = lines[end].rstrip()
+        if last.endswith("|| true"):
+            continue
+        # `a && b || true` makes the whole chain non-fatal, which is the intent.
+        lines[end] = last + " || true"
+        return (
+            _join(lines),
+            "dependency install made non-fatal — the image may be "
+            "INCOMPLETE (some dependencies are missing)",
+        )
     return None
 
 

@@ -113,6 +113,18 @@ def _message_prefix(finding: dict) -> str:
         return ("[STRUCTURALLY DEMONSTRATED — a probe showed the condition "
                 "holds. This is NOT `proven`.] ")
     if structural == "refuted":
+        # A refutation the adversarial verifier argued past is still printed,
+        # but it must not read as an unopposed one: a pipeline that
+        # auto-dismisses on this prefix would drop a finding two independent
+        # verifiers upheld. Both facts go in the sentence.
+        validation = finding.get("validation")
+        verdict = (validation or {}).get("verdict") if isinstance(
+            validation, dict) else None
+        if verdict == "confirmed":
+            return ("[STRUCTURALLY REFUTED, AND THE REFUTATION WAS OVERTURNED — "
+                    "a probe ran and the condition did not hold, and adversarial "
+                    "verification confirmed the finding anyway, in writing. Read "
+                    "both before dismissing.] ")
         return ("[STRUCTURALLY REFUTED — a probe ran and the condition did not "
                 "hold. Treat this finding as counter-evidenced.] ")
     if execution:

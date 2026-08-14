@@ -1211,6 +1211,37 @@ def mine(
             f"{len(analysed)} security-language commit(s) examined; none touched a line "
             f"matching the sink tables"
         )
+        # An empty mine has two very different causes and they must not read
+        # alike. Either this project genuinely has no security history, or its
+        # history is real and this miner cannot see it — the sink tables are
+        # injection-shaped, so a library whose past fixes are bounds checks,
+        # guard constants and state-machine transitions scores zero.
+        #
+        # Observed on a sans-IO HTTP/2 target: 48 keyword-matching commits, 7
+        # analysed, 0 patches — while the tree carried CONTINUATION_BACKLOG, a
+        # SizeLimitDict on closed streams and a MAX_CONCURRENT_STREAMS default,
+        # every one of them a real past DoS fix. The run recorded "no history"
+        # and seeded nothing, which reads as a clean bill.
+        payload["lens"] = {
+            "keyed_on": "injection sink tables (SINKS_BY_LANG)",
+            "blind_to": [
+                "bounds and guard constants (a new MAX_*/LIMIT/BACKLOG cap)",
+                "state-machine transition tables",
+                "flow-control and accounting arithmetic",
+                "allocation caps and size-limited containers",
+            ],
+            "note": (
+                "A zero here means 'no commit touched a sink-table line', NOT "
+                "'this project has no security history'. If the target's defect "
+                "class is resource, protocol or state shaped, treat this as an "
+                "uncovered lens and say so in the report rather than reporting "
+                "an absence of history."
+            ),
+        }
+        payload["notes"] = list(payload.get("notes") or []) + [
+            "history lens is injection-keyed and found nothing; see payload.lens "
+            "before reporting this as 'no security history'"
+        ]
     return payload
 
 

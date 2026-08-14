@@ -37,7 +37,10 @@ log = logging.getLogger(__name__)
 # see `_ADVISORY_VERSIONS` — because that is a deliberate advisory statement,
 # not a gap.)
 NOT_DETERMINED = "_Not determined (static run)._"
-_ADVISORY_VERSIONS = "_Not determined — static run._"
+_ADVISORY_VERSIONS = (
+    "_Not established by this run — the scan reads one commit and does not "
+    "bisect history or test other releases._"
+)
 
 _SEV_ORDER = ["critical", "high", "medium", "low", "informational"]
 
@@ -335,6 +338,7 @@ def _summary_section(report: dict) -> list[str]:
     run_id = _s(report.get("run_id"))
     if run_id:
         out.append(f"**Run ID:** `{run_id}`")
+    out += _run_context_lines(report)
 
     summary = report.get("summary") or {}
     total = summary.get("total")
@@ -346,6 +350,72 @@ def _summary_section(report: dict) -> list[str]:
         line += f" — {tally}"
     out.append(line)
     out.append("")
+    return out
+
+
+def _run_context_lines(report: dict) -> list[str]:
+    """The header facts `phase4_report.md` prescribes, from `coverage.run_context`.
+
+    Two of these were required and rendered nowhere. The achieved isolation
+    tier appeared only further down, and the per-phase model list — the
+    "Model transparency" section of the phase file — appeared not at all,
+    which is the one line that makes a verification that shared the hunt's
+    model visible to a reader. Both are copied from the manifest by
+    `report_build._run_context`; nothing here derives anything.
+    """
+    ctx = (report.get("coverage") or {}).get("run_context") or {}
+    if not isinstance(ctx, dict) or not ctx:
+        return []
+    out: list[str] = []
+    repo = _s(ctx.get("target_repo"))
+    tag = _s(ctx.get("target_tag"))
+    commit = _s(ctx.get("target_commit"))
+    if repo or tag or commit:
+        parts = [p for p in (repo, tag, f"`{commit}`" if commit else "") if p]
+        out.append(f"**Upstream:** {' @ '.join(parts)}")
+    if _s(ctx.get("target_scope")):
+        out.append(f"**Scope:** `{_s(ctx['target_scope'])}` — nothing outside it was hunted")
+    started = _s(ctx.get("started_at"))
+    if started:
+        out.append(f"**Scan date:** {started[:10]}")
+    mode = _s(ctx.get("mode"))
+    if mode:
+        out.append(f"**Mode:** {mode}")
+    tier = _s(ctx.get("isolation_tier"))
+    if tier:
+        verified = ctx.get("isolation_verified")
+        suffix = ("sandbox verification passed" if verified is True
+                  else "sandbox verification did NOT pass" if verified is False
+                  else "sandbox verification not recorded")
+        out.append(f"**Isolation tier:** `{tier}` ({suffix})")
+    models = ctx.get("models")
+    if isinstance(models, dict) and models:
+        rendered = "; ".join(f"{k}={v}" for k, v in models.items())
+        out.append(f"**Models:** {rendered}")
+        hunt = _s(models.get("phase2_hunt")).split(" ")[0]
+        verify = _s(models.get("phase2c_verify")).split(" ")[0]
+        distinct = {str(v).split(" ")[0] for v in models.values()}
+        if hunt and verify and hunt != verify:
+            out.append(
+                f"**Model independence:** adversarial verification ran on "
+                f"`{verify}`, a different model than the hunt's `{hunt}`."
+            )
+        elif hunt and verify:
+            out.append(
+                "**Model independence:** NONE — verification ran on the same "
+                "model as the hunt and shared its blind spots."
+            )
+        elif len(distinct) == 1:
+            out.append(
+                "**Model independence:** every phase ran on the same model — "
+                "verification shared the hunt's blind spots."
+            )
+    deviations = ctx.get("harness_deviations")
+    if isinstance(deviations, int) and deviations:
+        out.append(
+            f"**Harness deviations:** {deviations} recorded in "
+            "`manifest.json:harness_deviations`"
+        )
     return out
 
 
@@ -422,6 +492,25 @@ def _execution_section(report: dict) -> list[str]:
         )
     out.append("")
 
+    # The uncovered inputs by name. A count on its own tells a reader that a
+    # gap exists and withholds the only thing that would let them close it,
+    # and "silence about a gap reads as coverage of it" is the phase file's
+    # own description of the most consequential lie a scanner can tell.
+    uncovered_rows = cvg.get("uncovered_inputs")
+    if isinstance(uncovered_rows, list) and uncovered_rows:
+        out += ["### Enumerated inputs NOT covered", "",
+                "Each row is attacker-reachable surface the run enumerated and "
+                "then did not trace to a sink. None of them is a clean result.",
+                ""]
+        out += _md_table(
+            ["Input", "Location", "Entry point", "Trust", "Why it is uncovered"],
+            [[_cell(r.get("id")), f"`{_cell(r.get('location'))}`",
+              _cell(r.get("entry_point")), _cell(r.get("trust_level")),
+              _cell(r.get("note") or r.get("reason"))]
+             for r in uncovered_rows if isinstance(r, dict)],
+        )
+        out.append("")
+
     note = _s(ex.get("not_provable_by_observer_note"))
     if note:
         out += [f"> **What \"not provable by this observer\" means.** {note}", ""]
@@ -437,7 +526,34 @@ def _execution_section(report: dict) -> list[str]:
         )
         out.append("")
 
+    artefact = ex.get("self_attribution_artefacts")
+    if isinstance(artefact, dict) and artefact.get("count"):
+        ids = ", ".join(f"`{_cell(i)}`" for i in artefact.get("finding_ids") or [])
+        out += [
+            f"> **{_int(artefact['count'])} of the `self_attributed` verdicts are a "
+            f"harness artefact, not a PoC that cheated.** {_s(artefact.get('note'))}"
+            + (f" Affected: {ids}." if ids else ""),
+            "",
+        ]
+
     out += _structural_block(ex.get("structural") or {})
+    out += _oracle_conflict_block(ex.get("oracle_conflicts") or {})
+
+    sites = cvg.get("sites_canonicalised_by_a_rejected_finding")
+    if isinstance(sites, dict) and sites.get("count"):
+        hidden = int(sites.get("with_a_confirmed_member_hidden") or 0)
+        out += [
+            f"- **Sites led by a rejected record:** {_int(sites['count'])} of the "
+            "deduplicated sites are represented by a finding the adversarial "
+            "verifier rejected, and are therefore withheld in full. "
+            + ("Every one of them had all its members rejected, so nothing "
+               "confirmed is hidden behind them."
+               if hidden == 0 else
+               f"**{hidden} of them hide a CONFIRMED finding**, withheld twice — "
+               "once as rejected, once as a duplicate of the rejected record. "
+               "That is a defect in the report, not a property of the code."),
+            "",
+        ]
 
     claimed = ex.get("overclaimed")
     if claimed is not None:
@@ -451,6 +567,43 @@ def _execution_section(report: dict) -> list[str]:
     for caveat in caveats:
         out += [f"> **Incomplete coverage.** {caveat}", ""]
 
+    return out
+
+
+def _oracle_conflict_block(conflicts: dict) -> list[str]:
+    """Where the oracles and the verifier disagreed, printed rather than resolved.
+
+    A report that shows only the verdict it happened to reach last is a report
+    that hides the one thing a reader can use to calibrate how much any single
+    verdict is worth.
+    """
+    if not isinstance(conflicts, dict) or not conflicts:
+        return []
+    out = ["### Where the oracles and the verifier disagreed", ""]
+    rows = (
+        ("demonstrated_but_rejected",
+         "A structural probe held and phase 2c still rejected the finding. The "
+         "predicate was true and the defect was not reachable with "
+         "attacker-supplied data — which is exactly why `demonstrated` is not "
+         "`proven` and not a substitute for the verifier."),
+        ("refuted_but_confirmed",
+         "A structural probe refuted the finding and phase 2c confirmed it "
+         "anyway, in writing. Read the finding's verification block before "
+         "deciding: an overturned refutation is a claim about the probe, and "
+         "it is printed here rather than deleted."),
+        ("proven_but_rejected",
+         "The execution gate observed the target's own frame interpret this "
+         "PoC's payload and phase 2c disagreed on re-reading the source. The "
+         "observation outranks the re-read, so the finding is delivered; the "
+         "disagreement is disclosed."),
+    )
+    for key, meaning in rows:
+        ids = conflicts.get(key)
+        if not ids:
+            continue
+        rendered = ", ".join(f"`{_cell(i)}`" for i in ids)
+        out += [f"- **`{key}`** ({len(ids)}): {rendered}. {meaning}"]
+    out.append("")
     return out
 
 
@@ -568,17 +721,30 @@ def _scan_metrics_section(report: dict) -> list[str]:
         out += [NOT_DETERMINED, ""]
         return out
 
-    def bullet(label: str, value: str) -> None:
-        out.append(f"- {label}: {value if value else 'Not determined (static run)'}")
+    # "(static run)" was printed against every absent metric, including on
+    # proof runs, which told a reader the wrong reason for the gap. An absent
+    # number is unmeasured; it is not evidence that execution did not happen.
+    def bullet(label: str, value: str, absent: str = "not measured on this run") -> None:
+        out.append(f"- {label}: {value if value else absent}")
 
-    bullet("Files in scope", _int(m.get("files_in_scope")))
-    bullet("Files analyzed (unique)", _int(m.get("files_analyzed")))
+    bullet("Files in scope", _int(m.get("files_in_scope")),
+           "not measured — this run recorded no file-level coverage ledger")
+    bullet("Files analyzed (unique)", _int(m.get("files_analyzed")),
+           "not measured — see the input ledger above for the coverage that was")
     cov = m.get("coverage_pct")
-    bullet("Coverage", f"{cov:.1f}%" if isinstance(cov, (int, float)) else "")
+    bullet("Coverage", f"{cov:.1f}%" if isinstance(cov, (int, float)) else "",
+           "no file-level percentage; the input ledger is the coverage disclosure")
     dur = m.get("duration_sec")
     bullet("Duration (sec)", _fmt_num(dur))
     cost = m.get("cost_usd")
-    bullet("Cost (USD)", f"${cost:.4f}" if isinstance(cost, (int, float)) else "")
+    bullet(
+        "Cost (USD)",
+        f"${cost:.4f}" if isinstance(cost, (int, float)) else "",
+        "deliberately not stated — no rate table was supplied, and no rate card "
+        "is compiled into PyHunt. Tokens and container time are measured and "
+        "reported under Cost, which is what can be priced against whatever "
+        "card applies",
+    )
     out.append("")
 
     # Coverage gaps belong next to the coverage number, not buried in JSON. A
@@ -716,6 +882,23 @@ def _verification_section(report: dict) -> list[str]:
         # rejected, when in fact none was even examined.
         note = v.get("precision_note") or "not computed (verification did not run)"
         out.append(f"- Verification precision: **not computed** — {note}")
+
+    # Where the difference between "recorded" and "delivered" went. The funnel
+    # above says how many findings were rejected; this says how many rows the
+    # report withheld and for which of two different reasons, so the gap
+    # between `Raw findings` and `Findings (N)` is arithmetic a reader can do
+    # rather than a number they have to trust.
+    withheld = (report.get("coverage") or {}).get("findings_withheld")
+    if isinstance(withheld, dict) and withheld:
+        parts = ", ".join(f"{k.replace('_', ' ')}: {_int(n)}"
+                          for k, n in sorted(withheld.items()))
+        out.append(f"- Withheld from the delivered set: {parts}")
+    out.append(
+        "- Nothing was deleted. Every rejected candidate keeps its own record "
+        "in `verify/<finding_id>.json` with the verifier's rationale, its "
+        "`checked_lines`, and the alternative explanation it ruled in — so a "
+        "reader can see what the run considered and dismissed, not only what "
+        "it kept.")
     out.append("")
     return out
 
@@ -781,6 +964,28 @@ def _finding_meta(f: dict) -> list[str]:
     if isinstance(units, int) and units > 1:
         out.append(
             f"**Found independently by:** {units} hunt units  ")
+
+    # The execution gate's verdict for THIS finding, by name. Disclosure 4 of
+    # `phase4_report.md` — "Each finding carries its outcome string verbatim.
+    # Render it, do not translate it into a pass/fail column" — and it was
+    # rendered only in aggregate, so a reader of a finding could not tell a
+    # `proven` one from a `no_event` one without opening `report.json`.
+    execution = f.get("execution") or {}
+    gate = _s(execution.get("outcome"))
+    if gate:
+        detail = _OUTCOME_MEANING.get(gate, "")
+        repeats = execution.get("repeats")
+        unanimous = execution.get("unanimous")
+        stamp = ""
+        if isinstance(repeats, int) and repeats:
+            stamp = f" ({repeats} replay{'s' if repeats != 1 else ''}"
+            if unanimous is True:
+                stamp += ", unanimous"
+            elif unanimous is False:
+                stamp += ", NOT unanimous"
+            stamp += ")"
+        out.append(f"**Execution gate:** `{gate}`{stamp}"
+                   + (f" — {detail}" if detail else "") + "  ")
 
     structural = f.get("structural") or {}
     outcome = _s(structural.get("outcome"))
@@ -931,7 +1136,19 @@ def _ghsa_block(f: dict) -> list[str]:
 
     # Proof of Concept — its own sub-header so the fenced PoC reads clearly.
     out += ["#### Proof of Concept", ""]
-    out += _poc_block(f.get("poc"))
+    poc = f.get("poc")
+    gate = _s(((f.get("execution") or {}).get("outcome")))
+    if not poc and gate == "not_applicable":
+        # A finding in a class no execution can settle has no PoC BY DESIGN,
+        # and "_Not determined (static run)._" tells the reader the opposite —
+        # that something was meant to be here and is missing.
+        out += ["_No PoC, deliberately. The execution gate returned "
+                "`not_applicable` for this finding: its class cannot be "
+                "settled by running code, so a PoC would demonstrate that the "
+                "behaviour occurs without saying anything about whether it is "
+                "allowed. The evidence is the source reading above._", ""]
+    else:
+        out += _poc_block(poc)
     out.append("")
 
     # Weaknesses — CWE id + name + MITRE link.

@@ -312,11 +312,18 @@ def container_cost(results_dir: Path) -> dict:
                 out[kind]["runs"] += len(runs)
                 for run in runs:
                     if isinstance(run, dict):
+                        # `duration_ms` is what `replay.py` and `structural.py`
+                        # actually record per run, and it was not in this list,
+                        # so container seconds read 0.0 on every run ever made
+                        # — the one cost figure that is not tokens, reported as
+                        # if the containers had taken no time at all.
                         for key in ("duration_seconds", "elapsed_seconds",
-                                    "seconds", "wall_seconds"):
+                                    "seconds", "wall_seconds", "duration_ms"):
                             value = run.get(key)
                             if isinstance(value, (int, float)):
-                                out[kind]["seconds"] += float(value)
+                                out[kind]["seconds"] += (
+                                    float(value) / 1000.0 if key.endswith("_ms")
+                                    else float(value))
                                 break
             elif isinstance(runs, int):
                 out[kind]["runs"] += runs
@@ -364,7 +371,17 @@ def outcome_counts(results_dir: Path) -> dict:
             elif isinstance(execution.get("proven_by_execution"), int):
                 counts["proven"] = execution["proven_by_execution"]
 
-        structural = report.get("structural")
+        # The structural tally lives beside the execution one, under
+        # `coverage.execution.structural` — the same place `report_build`
+        # writes it and the markdown renderer reads it. Looking for a
+        # top-level `structural` key found nothing on every real report, so
+        # `demonstrated` and therefore `settled` were always 0 and "cost per
+        # settled finding" — the number the phase file calls the one worth
+        # reading — could never be computed.
+        structural = execution.get("structural") if isinstance(
+            execution, dict) else None
+        if not isinstance(structural, dict):
+            structural = report.get("structural")
         if isinstance(structural, dict):
             by_outcome = structural.get("by_outcome")
             if isinstance(by_outcome, dict):
@@ -648,6 +665,22 @@ def to_markdown(payload: dict) -> str:
         f"{containers['replay']['records']} PoC(s), "
         f"{containers['structural']['runs']} structural probe run(s) over "
         f"{containers['structural']['records']} probe(s).")
+    # Seconds are stated per kind and never summed with the token line. A run
+    # that records no per-run duration says so instead of contributing a zero,
+    # because a measured 0.0 and an unrecorded 0.0 are different facts.
+    for kind, label in (("replay", "replay"), ("structural", "structural probe")):
+        block = containers[kind]
+        if not block["records"]:
+            continue
+        if block["seconds"]:
+            lines.append(
+                f"- {label} container time: {block['seconds']:.1f}s "
+                f"across {block['runs']} run(s).")
+        else:
+            lines.append(
+                f"- {label} container time: not recorded — these run records "
+                "carry no per-run duration, so the figure is unavailable "
+                "rather than zero.")
     lines.append("")
 
     lines += ["| what the spend bought | count | full-price tokens each |",

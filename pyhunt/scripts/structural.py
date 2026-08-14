@@ -193,7 +193,8 @@ def validate_spec(spec: Any) -> dict:
             raise SpecContractError(
                 "growth_curve needs an `input_builder` with a `kind` from the "
                 "closed builder vocabulary (repeat_str, list_of, nested_list, "
-                "nested_dict, repeat_key, json_text)")
+                "nested_dict, repeat_key, json_text, repeat_bytes, "
+                "framed_bytes)")
     if kind == "state_mutation":
         attribute = spec.get("attribute")
         if not isinstance(attribute, str) or not _DOTTED_RX.match(attribute):

@@ -42,3 +42,18 @@ SCAN-ISSUES.md
 # Running the test suite writes a graphify AST cache into the current working
 # directory.
 /graphify-out/
+
+# Run records and defect logs: development material, and — for the defect logs
+# specifically — line-level findings about third-party packages that have not
+# been reported to their maintainers. The tool ships; the map of what it found
+# in someone else's code does not.
+SCAN-ISSUES*.md
+V3-RUN.md
+OVERNIGHT-RUN.md
+PYHUNT-V2-CHANGES.md
+PYHUNT-V3-PLAN.md
+
+# Pointers to the results directory of the last run on this machine.
+.last_run_dir
+.v3_run_dir
+.h2_run_dir

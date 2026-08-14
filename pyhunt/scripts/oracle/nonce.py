@@ -81,6 +81,74 @@ def run_secret() -> str:
     return generated
 
 
+def secret_is_durable() -> bool:
+    """True when the run secret already exists outside this process.
+
+    An in-process mint is exported to `os.environ` and dies with the process.
+    Every phase is a separate process, so a nonce derived from an unpersisted
+    secret is unreproducible by the phase that has to verify it — and nothing
+    fails: `poc_execution_block` returns a perfectly well-formed nonce, and
+    replay later derives a *different* one, finds no match, and reports
+    `sink_reached_unproven`. Both ends look healthy; the proof is simply gone.
+
+    This is the same class of failure the `poc_execution_block` docstring
+    already guards against, arriving by a different route. That guard hardened
+    against a **null** nonce; this one is a non-null nonce with no durable key.
+    Observed on a real run: `resolve_run_secret` reported `unavailable` while 36
+    valid-looking nonces were being minted.
+    """
+    return bool(os.environ.get(_ENV_SECRET))
+
+
+def ensure_durable_secret(results_dir) -> str:
+    """Mint the run secret if needed and write it down. Returns the secret.
+
+    Writes a ``.run_secret`` sidecar (0600) beside the run's other state, which
+    is where :func:`replay.resolve_run_secret` looks after the environment and
+    ``manifest.json``. Call this **before** deriving any nonce.
+    """
+    import pathlib
+    path = pathlib.Path(results_dir) / ".run_secret"
+
+    # The sidecar wins, and it is read BEFORE anything is minted.
+    #
+    # This used to call `run_secret()` first. In a process that has not
+    # exported PYHUNT_RUN_SECRET — which is every fresh process, and every
+    # phase is a fresh process — that mints a new random secret, finds it
+    # differs from the sidecar, and then *overwrites the sidecar with it*.
+    #
+    # Every nonce already embedded in an authored PoC is keyed to the old
+    # secret, so it is invalidated in the same breath, and nothing fails:
+    # replay derives a different nonce, matches nothing, and reports
+    # `sink_reached_unproven` — which is also exactly what a working defence
+    # looks like. Measured on the dca-avroschema v3 run: 102 of 102 PoCs came
+    # back with `nonce_in_poc: false` and the run produced **zero** `proven`
+    # findings, on a target with a live `eval()` on attacker-controlled text.
+    # The hunters had embedded their nonces correctly; a later process had
+    # moved the key underneath them.
+    #
+    # `secret_is_durable`'s docstring already describes this failure class
+    # ("a non-null nonce with no durable key"). The guard existed; the writer
+    # one level below it was the thing creating the condition.
+    try:
+        stored = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        stored = ""
+    if stored:
+        # Export it so every later derivation in this process agrees with the
+        # PoCs already on disk.
+        os.environ[_ENV_SECRET] = stored
+        return stored
+
+    secret = run_secret()
+    try:
+        path.write_text(secret + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return secret
+
+
 def nonce_for(run_id: str, finding_key: str) -> str:
     """Derive the nonce for one PoC.
 

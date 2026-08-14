@@ -89,7 +89,7 @@ from graph.config import safe_walk_files
 from json_utils import validate_schema
 from lang_hints import EXT_TO_LANG, SPECIALIST_HINTS, is_iac_file
 from specialists import active_specialists, build_specialist_tasks
-from taint import build_sink_backward_tasks, build_taint_tasks
+from taint import build_sink_backward_tasks, build_taint_tasks, in_scope
 
 log = logging.getLogger("pyhunt.tasks")
 
@@ -215,10 +215,71 @@ def _utc_now() -> str:
 
 
 # ---------------------------------------------------------------------------
+# The declared analysis scope
+# ---------------------------------------------------------------------------
+
+def read_target_scope(results_dir: Path, inputs_payload: dict,
+                      repo_path: Path) -> tuple[str, ...]:
+    """Repo-relative prefixes the run declared it is auditing, or ``()``.
+
+    Phase 0 writes ``target_scope`` into ``manifest.json`` and phase 1 echoes it
+    into ``inputs.json``; until now nothing downstream read either copy. A run
+    could therefore declare "analysis scope ``src/h2`` only", have phase 1
+    honour it (149 of 153 enumerated inputs inside it), and then have this
+    phase spend 39 of 57 tasks on ``tests/``, ``examples/``, ``docs/`` and
+    ``visualizer/`` — surfaces the run had already said it was not auditing.
+
+    That is worse than wasted budget, because the sinks out there are real:
+    the bundled example servers do `open(path)` on a request-derived name, so
+    the generator produced fifteen confident path-traversal tasks about demo
+    code and none about the protocol library the scan was for. Findings from
+    those files are not findings in the artefact being assessed, and the
+    coverage denominator computed over them describes a different repository
+    than the one named in the manifest.
+
+    Absent, empty or unresolvable ``target_scope`` returns ``()`` — the whole
+    repository, which is what every run that declares no scope has always got.
+    A declared prefix that does not exist on disk is dropped with a warning
+    rather than silently emptying the universe: a typo must not turn into a
+    zero-file scan reported as a clean one.
+    """
+    raw: object = inputs_payload.get("target_scope")
+    if not raw:
+        try:
+            manifest = _read_json(results_dir / "manifest.json")
+        except ContractViolation:
+            manifest = None
+        if isinstance(manifest, dict):
+            raw = manifest.get("target_scope")
+
+    if isinstance(raw, str):
+        candidates = [raw]
+    elif isinstance(raw, (list, tuple)):
+        candidates = [c for c in raw if isinstance(c, str)]
+    else:
+        return ()
+
+    kept: list[str] = []
+    for candidate in candidates:
+        rel = candidate.strip().strip("/")
+        if not rel or rel == ".":
+            continue
+        if not (repo_path / rel).exists():
+            log.warning(
+                "target_scope %r does not exist under %s — ignoring it rather "
+                "than sweeping zero files", candidate, repo_path,
+            )
+            continue
+        kept.append(rel)
+    return tuple(sorted(set(kept)))
+
+
+# ---------------------------------------------------------------------------
 # The file universe (D7)
 # ---------------------------------------------------------------------------
 
-def sweepable_source_files(repo_path: Path, graph: Any = None) -> list[str]:
+def sweepable_source_files(repo_path: Path, graph: Any = None,
+                           scope: tuple[str, ...] = ()) -> list[str]:
     """Repo-relative paths of every file the specialist gates and the catch-all
     sweep should consider.
 
@@ -249,6 +310,8 @@ def sweepable_source_files(repo_path: Path, graph: Any = None) -> list[str]:
     with exclusion disabled and applies the skip list to `rel` itself.
     """
     def _sweepable(rel: str) -> bool:
+        if not in_scope(rel, scope):
+            return False
         return PurePosixPath(rel).suffix.lower() in EXT_TO_LANG or is_iac_file(rel)
 
     def _noise(rel: str) -> bool:
@@ -443,7 +506,7 @@ def _covered_files(tasks: Iterable[dict]) -> set[str]:
 
 def gen_taint(
     gq: Any, graph_info: dict, inputs: list[dict], repo_path: Path,
-    notes: list[str],
+    notes: list[str], scope: tuple[str, ...] = (),
 ) -> tuple[list[dict], dict]:
     """Forward (input → sink) call-graph path tasks.
 
@@ -460,7 +523,7 @@ def gen_taint(
     try:
         tasks = build_taint_tasks(
             gq, inputs, repo_path,
-            max_tasks=TAINT_MAX_TASKS, max_hops=TAINT_MAX_HOPS,
+            max_tasks=TAINT_MAX_TASKS, max_hops=TAINT_MAX_HOPS, scope=scope,
         )
     except Exception as exc:  # fail-open — taint must never abort a run
         log.warning("taint chunking failed (continuing run): %s", exc)
@@ -469,12 +532,23 @@ def gen_taint(
     status = {"status": "ok", "tasks": len(kept)}
     if dropped:
         status["dropped_invalid"] = dropped
+    if len(tasks) >= TAINT_MAX_TASKS:
+        # A cap that is hit silently is a coverage claim that is wrong in the
+        # one direction that matters — the same reasoning that makes
+        # `coverage.catchall_dropped` mandatory output. Reachable entry→sink
+        # pairs beyond this point exist and were not queued.
+        status["capped_at"] = TAINT_MAX_TASKS
+        notes.append(
+            f"taint: hit the {TAINT_MAX_TASKS}-task cap — further reachable "
+            f"entry->sink paths exist and were NOT queued; treat forward-taint "
+            f"coverage as partial"
+        )
     return kept, status
 
 
 def gen_sink_backward(
     gq: Any, graph_info: dict, inputs: list[dict], repo_path: Path,
-    notes: list[str],
+    notes: list[str], scope: tuple[str, ...] = (),
 ) -> tuple[list[dict], dict]:
     """Orphan-sink backward audit tasks — dangerous sinks no enumerated input
     reaches forward, hunted backward through their callers.
@@ -496,6 +570,7 @@ def gen_sink_backward(
             gq, inputs, repo_path,
             max_tasks=SINKBACK_MAX_TASKS,
             max_back_hops=SINKBACK_MAX_BACK_HOPS,
+            scope=scope,
         )
     except Exception as exc:  # fail-open — sink-backward must never abort
         log.warning("sink-backward failed (continuing run): %s", exc)
@@ -658,9 +733,15 @@ def _entry_points_by_file(
 def build_entry_forward_tasks(
     recon: dict, inputs: list[dict], enumeration: dict, covered: set[str],
     *, max_tasks: int = ENTRY_FORWARD_MAX_TASKS,
+    scope: tuple[str, ...] = (),
 ) -> tuple[list[dict], dict]:
     """One task per entry-point file, uncovered and most-public first."""
     by_file = _entry_points_by_file(recon, inputs, enumeration)
+    if scope:
+        # The recon sweep enumerates the whole checkout, so on a scoped run its
+        # richest "entry points" are the test suite's own fixtures. Those are
+        # entry points into the tests, not into the artefact under audit.
+        by_file = {f: row for f, row in by_file.items() if in_scope(f, scope)}
     if not by_file:
         return [], {"status": "skipped:no_entry_points", "tasks": 0}
 
@@ -782,7 +863,7 @@ def build_entry_forward_tasks(
 
 def gen_entry_forward(
     recon: dict, inputs: list[dict], results_dir: Path, covered: set[str],
-    notes: list[str],
+    notes: list[str], scope: tuple[str, ...] = (),
 ) -> tuple[list[dict], dict]:
     """Entry-point-forward tasks. **Fail-open**, and gated on nothing.
 
@@ -794,7 +875,7 @@ def gen_entry_forward(
     try:
         enumeration = load_recon_enumeration(results_dir)
         tasks, status = build_entry_forward_tasks(
-            recon, inputs, enumeration, covered)
+            recon, inputs, enumeration, covered, scope=scope)
     except Exception as exc:  # fail-open — never abort a run
         log.warning("entry-forward failed (continuing run): %s", exc)
         return [], {"status": f"failed:{type(exc).__name__}: {exc}", "tasks": 0}
@@ -984,6 +1065,17 @@ def generate(repo_path: Path, results_dir: Path, *,
     inputs = _input_records(inputs_payload)
     notes: list[str] = []
 
+    # 0. The declared analysis scope. Every source below is restricted to it,
+    #    so the coverage denominator describes the artefact the manifest names.
+    scope = read_target_scope(results_dir, inputs_payload, repo_path)
+    if scope:
+        notes.append(
+            "analysis scope restricted to target_scope="
+            + ", ".join(scope)
+            + " (declared in manifest.json/inputs.json); files outside it were "
+              "not queued and are not counted in coverage"
+        )
+
     # 1. The call graph, and the reachability gate over it.
     gq, graph_info = build_graph(
         repo_path, results_dir / "logs" / "graph.json"
@@ -1003,18 +1095,18 @@ def generate(repo_path: Path, results_dir: Path, *,
 
     # 2. Forward taint paths.
     taint_tasks, sources["taint"] = gen_taint(
-        gq, graph_info, inputs, repo_path, notes
+        gq, graph_info, inputs, repo_path, notes, scope
     )
     queued.extend(taint_tasks)
 
     # 3. Orphan sinks, backward.
     sinkback_tasks, sources["sink_backward"] = gen_sink_backward(
-        gq, graph_info, inputs, repo_path, notes
+        gq, graph_info, inputs, repo_path, notes, scope
     )
     queued.extend(sinkback_tasks)
 
     # The D7 file universe — shared by the specialist gates and the sweep.
-    source_files = sweepable_source_files(repo_path, gq)
+    source_files = sweepable_source_files(repo_path, gq, scope)
     if not source_files:
         notes.append(
             "sweepable file universe is empty — no file in the target matched "
@@ -1028,7 +1120,7 @@ def generate(repo_path: Path, results_dir: Path, *,
     #    tables are the reason something was missed.
     ef_covered = _covered_files(queued)
     entry_tasks, sources["entry_forward"] = gen_entry_forward(
-        inputs_payload, inputs, results_dir, ef_covered, notes
+        inputs_payload, inputs, results_dir, ef_covered, notes, scope
     )
     queued.extend(entry_tasks)
 
@@ -1065,6 +1157,7 @@ def generate(repo_path: Path, results_dir: Path, *,
         "run_id": _read_run_id(results_dir),
         "generated_at": _utc_now(),
         "repo": str(repo_path),
+        "target_scope": list(scope),
         "graph": graph_info,
         "sources": sources,
         "coverage": {

@@ -134,6 +134,31 @@ be emitted with a `vuln_class` the table recognises, which is why
 
 ## 3. Group tasks into hunt units
 
+**This is a script. Run it; do not do it by hand.**
+
+```bash
+python3 "${SKILL_DIR}/scripts/units.py" plan \
+  --results-dir "${RESULTS_DIR}" --repo "${TARGET}"
+```
+
+It writes `logs/hunt_plan.json` **and** `logs/assignments/<unit_id>.json` for
+every unit, together, with the per-task nonce already minted into each one.
+
+The reason it is a script is the reason §4 gives for everything else here: a
+mechanical step that lives in prose gets done differently each run. On the run
+that produced this change the orchestrator planned by hand and wrote assignment
+files for the 40 units inside the cap and not for the 3 beyond it. Three
+subagents were dispatched at paths that did not exist, noticed, and rebuilt
+their own assignments from `tasks.json` — losing the inputs subset, the design
+controls, and `poc_execution_by_task`, which is where the nonce lives. They were
+LOG and RES units so no PoC needed one; an INJ unit in that position would have
+authored PoCs carrying no run-derived value, and gate condition 3 would have
+been unsatisfiable for every finding it produced. That is RealVuln's B7 arriving
+by a different road, and it is why the plan and the assignments are now written
+by one call or not at all.
+
+The rules the script implements, kept here because you need to read its output:
+
 A **unit** is one subagent's work: one class group, one location, at most five
 tasks.
 
@@ -159,7 +184,7 @@ fix the grouping, do not proceed.
 ## 4. Bound the fan-out — and record exactly what the bound cuts
 
 ```
-MAX_CONCURRENT_UNITS   = 6      # per wave
+MAX_CONCURRENT_UNITS   = 6      # in flight at once, NOT per wave
 MAX_UNITS_PER_RUN      = 40
 MAX_TASKS_PER_UNIT     = 5
 ```
@@ -170,11 +195,30 @@ API, so budget enforcement here is advisory (PLAN.md §5.2). What survives the
 move is the honest half: **every unit the bound cuts is recorded, and a scan
 that did not cover everything says so.**
 
-**Wave discipline.** Dispatch at most `MAX_CONCURRENT_UNITS` subagents in a
-single message. Wait for all of them to write their result files, then dispatch
-the next wave. Do not dispatch all units at once regardless of count — high
+**Rolling dispatch, not waves.** Keep at most `MAX_CONCURRENT_UNITS` subagents in
+flight. When any one of them returns, validate its file (§6) and dispatch the
+next unit immediately. Do not wait for a whole batch to finish before starting
+the next, and do not dispatch all units at once regardless of count — high
 concurrency saturates rate limits and a rate-limited agent returns *nothing*,
 which is indistinguishable from *clean code* unless you go looking.
+
+**This used to say "wait for all of them", and that cost about a third of the
+fan-out.** Measured on the dca-avroschema v3 run: 8.75 hours of agent work
+across 43 units finished in 2.38 hours of wall clock — a 3.68× speedup against a
+cap of 6, where the cap alone allows 6×. Wave 3's fastest unit returned in 2.1
+minutes and its slowest in 20.9; the batch paid 20.9 and five slots idled
+through the difference. Rolling dispatch at the same cap puts that run at roughly
+1.5 hours instead of 2.4.
+
+Nothing about the per-unit checks changes. §6 still confirms every unit's file
+before its slot is reused, and a missing file is still unknown coverage rather
+than "no findings" — that check is per unit and never needed a synchronisation
+point to be correct.
+
+**Dispatch order matters more once dispatch is rolling.** `units.py` sorts the
+plan by the §4 ordering below and stamps `dispatch_order`; start units in that
+order so that if the run is interrupted, what completed is the most valuable
+work rather than an arbitrary prefix.
 
 **Ordering before truncation.** If there are more than `MAX_UNITS_PER_RUN`
 units, sort before you cut, so the cut falls on the least valuable work:

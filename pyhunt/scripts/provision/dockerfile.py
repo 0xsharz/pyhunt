@@ -44,11 +44,59 @@ from provision.fingerprint import ProjectFingerprint, _version_key
 #     the probe says so and declines to judge.
 DEPS_UNKNOWN_MARKER = "DEPENDENCY CHECK NOT POSSIBLE"
 
+#   * The wanted set is read from **every** place a Python project declares its
+#     dependencies, not just `requirements.txt`. The probe used to open with
+#     `[ -f requirements.txt ] || exit 0`, so a pip-tools layout shipping
+#     `requirements/base.in`, or any pyproject-only project, produced "no
+#     manifest" and the caller read the exit 0 as `deps_ok: True`. Observed on a
+#     FastAPI target: the image had neither fastapi nor jinja2 installed and
+#     provisioning reported the environment complete. Absence of a manifest is
+#     now `unknown`; only a manifest that genuinely declares nothing passes.
+# A `requirements/` directory is a mainstream pip-tools layout, and neither
+# python template looked inside one: a target declaring fastapi and jinja2 in
+# `requirements/base.in` got an image with neither. The `.in` files are
+# installed too, because a repo that commits only the inputs and generates the
+# pinned `.txt` at build time (via its Makefile, which the provisioner does not
+# run) would otherwise contribute nothing. `-r` lines inside them resolve
+# relative to the file, so a `base.in` including `common.in` still works.
+_REQ_DIR_INSTALL = (
+    "RUN for f in requirements/*.txt requirements/*.in requirements-*.txt; do \\\n"
+    "        [ -f \"$f\" ] && (pip install --no-cache-dir -r \"$f\" || true); \\\n"
+    "    done; true"
+)
+
+_PYPROJECT_DEPS = (
+    "import sys;"
+    "t=__import__('tomllib') if sys.version_info>=(3,11) else None;"
+    "d=t.load(open('pyproject.toml','rb')) if t else {};"
+    "p=(d.get('project') or {}).get('dependencies') or [];"
+    "q=((d.get('tool') or {}).get('poetry') or {}).get('dependencies') or {};"
+    "print(chr(10).join(list(p)+[k for k in q if k.lower()!='python']))"
+)
+
 _PIP_DEPS_PROBE = (
-    "[ -f requirements.txt ] || exit 0; "
+    ": > /tmp/want.raw; found=0; "
+    "for f in requirements.txt requirements-*.txt requirements/*.txt "
+    "requirements/*.in; do "
+    "  [ -f \"$f\" ] && { found=1; cat \"$f\" >> /tmp/want.raw; }; "
+    "done; "
+    "pyx=''; for c in python3 python; do "
+    "  command -v \"$c\" >/dev/null 2>&1 && { pyx=\"$c\"; break; }; done; "
+    "if [ -f pyproject.toml ] && [ -n \"$pyx\" ]; then found=1; "
+    f"  \"$pyx\" -c \"{_PYPROJECT_DEPS}\" >> /tmp/want.raw 2>/dev/null; fi; "
+    f"[ \"$found\" = 1 ] || {{ echo '{DEPS_UNKNOWN_MARKER}: no dependency "
+    "manifest found (requirements*.txt, requirements/*.in, pyproject.toml), so "
+    "there is nothing to check the image against'; exit 0; }; "
+    # `pip list --format=freeze` first, because plain `pip freeze` omits pip,
+    # setuptools and wheel by design. A target that pins `pip~=25.3` in its
+    # requirements therefore had pip itself reported as a missing dependency of
+    # a correctly provisioned image — the false alarm mirrors the false green
+    # above, and both make the probe's verdict worthless.
     "freeze=''; "
-    "for c in 'pip' 'pip3' 'python3 -m pip' 'python -m pip' 'uv pip'; do "
-    "  if $c freeze >/tmp/have.raw 2>/dev/null && [ -s /tmp/have.raw ]; then "
+    "for c in 'pip list --format=freeze' 'pip3 list --format=freeze' "
+    "'python3 -m pip list --format=freeze' 'pip freeze' 'pip3 freeze' "
+    "'python3 -m pip freeze' 'python -m pip freeze' 'uv pip freeze'; do "
+    "  if $c >/tmp/have.raw 2>/dev/null && [ -s /tmp/have.raw ]; then "
     "    freeze=\"$c\"; break; fi; "
     "done; "
     f"[ -n \"$freeze\" ] || {{ echo '{DEPS_UNKNOWN_MARKER}: no working pip in the "
@@ -56,7 +104,7 @@ _PIP_DEPS_PROBE = (
     "grep -v '^-' /tmp/have.raw "
     "| sed -e 's/[[:space:]]*@.*//' -e 's/[=<>].*//' "
     "| tr 'A-Z_.' 'a-z--' | sort -u > /tmp/have; "
-    "grep -v ';' requirements.txt "
+    "grep -v ';' /tmp/want.raw "
     "| sed -e 's/#.*//' -e 's/\\[.*\\]//' -e 's/[[:space:]]*@.*//' "
     "-e 's/[<>=!~].*//' -e 's/[[:space:]]//g' "
     "| grep -v '^$' | grep -v '^-' | tr 'A-Z_.' 'a-z--' | sort -u > /tmp/want; "
@@ -166,7 +214,8 @@ ECOSYSTEM_TEMPLATES: dict[str, dict] = {
         # an image that builds but has none of the target's dependencies.
         "install": (
             "RUN if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi \\\n"
-            "    && if [ -f setup.py ] || [ -f pyproject.toml ]; then pip install -e . || true; fi"
+            "    && if [ -f setup.py ] || [ -f pyproject.toml ]; then pip install -e . || true; fi\n"
+            + _REQ_DIR_INSTALL
         ),
         "build": "python -c \"import sys; print(sys.version)\"",
         "test": "pytest -q || true",
@@ -235,7 +284,8 @@ ECOSYSTEM_TEMPLATES: dict[str, dict] = {
             "        || uv export --no-dev --no-hashes -o requirements.txt || true) \\\n"
             "    && (if [ -s requirements.txt ]; then \\\n"
             "            uv pip install --system -r requirements.txt || true; fi) \\\n"
-            "    && (uv pip install --system --no-deps -e . || pip install -e . || true)"
+            "    && (uv pip install --system --no-deps -e . || pip install -e . || true)\n"
+            + _REQ_DIR_INSTALL
         ),
         "build": "python -c \"import sys; print(sys.version)\"",
         "test": "pytest -q || true",
@@ -342,12 +392,25 @@ def _resolve_version(fp: ProjectFingerprint, t: dict) -> str:
     return default
 
 
-def render_dockerfile(fp: ProjectFingerprint, repo_path: Path) -> RenderedRecipe:
+def render_dockerfile(fp: ProjectFingerprint, repo_path: Path,
+                      *, ignore_existing: bool = False) -> RenderedRecipe:
+    """Render the build recipe for `fp`.
+
+    `ignore_existing` skips the repo's own Dockerfile and templates the
+    ecosystem instead. The repo's recipe is the highest-signal source and stays
+    the default, but it is written for the maintainer's build, not for a
+    provisioner: it can assume a `make` step ran first, or COPY a lockfile the
+    repo generates and does not commit. When it fails for such a reason no
+    repair rule can recover it, and the ladder's last resort — softening the
+    install — yields an image with the target's source and none of its
+    dependencies. `build.py` retries with this flag before accepting that.
+    """
     # 1. Prefer an existing repo recipe (highest signal).
-    for rel in fp.existing_recipes:
-        if Path(rel).name == "Dockerfile":
-            return RenderedRecipe(source="existing", path=rel,
-                                  notes=["reused existing repo Dockerfile"])
+    if not ignore_existing:
+        for rel in fp.existing_recipes:
+            if Path(rel).name == "Dockerfile":
+                return RenderedRecipe(source="existing", path=rel,
+                                      notes=["reused existing repo Dockerfile"])
 
     # 2. Otherwise template the highest-priority known ecosystem.
     eco = _pick_ecosystem(fp)

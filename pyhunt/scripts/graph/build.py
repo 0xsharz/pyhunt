@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import check_backend_isolation, iter_source_files, language_for_path
+from .dispatch import augment as augment_dispatch
 from .fallback import build_fallback_graph
 from .schema import Backend, Confidence, Edge, GraphDocument, Node, SCHEMA_VERSION
 
@@ -105,6 +106,56 @@ def _save_cache(cache_path: Path, doc: GraphDocument) -> None:
 
 
 @contextlib.contextmanager
+def _isolated_graphify_output():
+    """Point graphify's output/cache directory at a throwaway absolute path.
+
+    D-14, second mechanism. :func:`_scratch_cwd` moves the working directory so
+    a *relative* ``graphify-out/`` lands outside the target. That is necessary
+    and it is not sufficient, because graphify does not resolve its output
+    directory against the cwd. ``graphify.cache._stat_index_file`` computes::
+
+        base = _out if _out.is_absolute() else Path(root).resolve() / _out
+
+    — ``root`` being the corpus being scanned. So with the cwd guard fully
+    working, a scan of ``<target>`` still creates
+    ``<target>/graphify-out/cache/stat-index.json``. Verified: the guard was in
+    place, the scan ran, and ``git status`` in the target reported
+    ``?? graphify-out/`` anyway.
+
+    That matters more than one stray directory. PyHunt states, twice and in
+    absolute terms, that it never modifies the target — and every hunt agent
+    that runs afterwards sees an untracked directory it cannot account for. A
+    scanner that writes into the tree it is measuring cannot claim to have
+    measured the unmodified tree, and ``repo_guard.py assert`` is entitled to
+    fail the run over it.
+
+    The override is ``GRAPHIFY_OUT``, and ``graphify.paths`` reads it **at
+    import time** into a module-level constant, so it has to be set before
+    ``import graphify`` — which is why this wraps the import as well as the
+    calls. An absolute value is required; a relative one would be re-resolved
+    against the corpus root and land right back in the target.
+    """
+    scratch = tempfile.mkdtemp(prefix="pyhunt-graphify-out-")
+    previous = os.environ.get("GRAPHIFY_OUT")
+    os.environ["GRAPHIFY_OUT"] = scratch
+    if "graphify.paths" in sys.modules:
+        # Already imported — the constant is fixed and this override cannot
+        # take effect. Say so rather than let the target be written to quietly.
+        log.warning(
+            "graph.build: graphify was imported before GRAPHIFY_OUT was set; "
+            "the extractor may write graphify-out/ into the target",
+        )
+    try:
+        yield Path(scratch)
+    finally:
+        if previous is None:
+            os.environ.pop("GRAPHIFY_OUT", None)
+        else:
+            os.environ["GRAPHIFY_OUT"] = previous
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+@contextlib.contextmanager
 def _scratch_cwd():
     """Run the extractor from a throwaway directory, never from the target.
 
@@ -145,6 +196,13 @@ def _scratch_cwd():
 
 def _try_graphify_build(root: Path, content_hash: str) -> GraphDocument | None:
     """Attempt a graphify AST-only build. Returns None on any failure (REQ-GRA-006)."""
+    # GRAPHIFY_OUT must be set before `import graphify` (see
+    # _isolated_graphify_output), so the whole attempt runs inside it.
+    with _isolated_graphify_output():
+        return _try_graphify_build_inner(root, content_hash)
+
+
+def _try_graphify_build_inner(root: Path, content_hash: str) -> GraphDocument | None:
     isolation_violations = check_backend_isolation()
     if isolation_violations:
         log.warning(
@@ -412,14 +470,25 @@ def build_graph(root_dir: str | Path) -> GraphDocument:
 
 
 def build_or_load(root_dir: str | Path, cache_path: str | Path) -> GraphDocument:
-    """Load the cached graph if content-hash matches, else rebuild and cache."""
+    """Load the cached graph if content-hash matches, else rebuild and cache.
+
+    Both paths run :func:`graph.dispatch.augment`, which recovers the ``calls``
+    edges an AST extractor structurally cannot draw — the callee of
+    ``self._table[key](arg)`` is a dict value chosen at run time, so the whole
+    dispatched layer otherwise has zero in-edges and looks unreachable from the
+    entry point that drives it. ``augment`` is idempotent (it skips any edge
+    already present), so running it after a cache load neither duplicates edges
+    nor requires a cache-version bump.
+    """
     root = Path(root_dir).resolve()
     cache = Path(cache_path)
     content_hash = _content_hash(root)
     cached = _load_cache_if_valid(cache, content_hash)
     if cached is not None:
+        augment_dispatch(root, cached)
         return cached
     doc = build_graph(root)
+    augment_dispatch(root, doc)
     try:
         _save_cache(cache, doc)
     except OSError as exc:

@@ -66,6 +66,20 @@ import findings_io
 #: not absorb two unrelated calls in the same function.
 DEFAULT_WINDOW = 3
 
+#: The window a *pre-verification* grouping may use. Zero, and it is not a knob.
+#:
+#: Windowed, class-family grouping is right for the report: by then every member
+#: has its own verdict and the grouping only decides how the rows are presented.
+#: It is wrong upstream of phase 2c, because there the group's canonical is the
+#: only member anyone verifies and the rest inherit its verdict — so a merge that
+#: is wrong deletes a finding instead of formatting one.
+#:
+#: That failure is not hypothetical. On the RealVuln run `app/config.py:13` and
+#: `:15` were two different committed secrets; a window of 3 and a shared class
+#: family merged them, and the benchmark scored the second as a miss. Verifying
+#: only the canonical would have meant nobody ever read it.
+VERIFY_WINDOW = 0
+
 #: Class strings drift ("codegen_injection", "codegen-injection", "code
 #: generation injection"). Grouping on the raw string would leave the same
 #: defect in two groups, which is the failure this file exists to fix, so the
@@ -171,6 +185,71 @@ def group_findings(findings: Sequence[dict], window: int = DEFAULT_WINDOW,
     return groups
 
 
+def exact_site_groups(findings: Sequence[dict]) -> list[list[dict]]:
+    """Group only findings that are *certainly* the same defect.
+
+    Same normalised file, same exact line span, same exact ``vuln_class`` — no
+    window, no class-family folding. Two findings that satisfy all three are the
+    same line described twice by two agents that could not see each other; there
+    is no reading of the evidence on which they are separate defects.
+
+    This is the grouping a verification plan may use. :func:`group_findings` is
+    the grouping a *report* may use, and the two must not be swapped: see
+    :data:`VERIFY_WINDOW` for the finding that cost.
+    """
+    buckets: dict[tuple, list[dict]] = defaultdict(list)
+    for finding in findings:
+        buckets[(_norm_file(finding.get("file")),
+                 _line_range(finding),
+                 str(finding.get("vuln_class") or "").strip().lower())].append(finding)
+    return [sorted(members, key=lambda f: str(f.get("finding_id")))
+            for _, members in sorted(buckets.items(), key=lambda kv: str(kv[0]))]
+
+
+def verify_plan(results_dir: str | Path) -> dict:
+    """One verification dispatch per exact site, with its members named.
+
+    Phase 2c dispatches one adversarial verifier per *finding*, and site dedupe
+    has historically run in phase 3 — after it. On a real run that meant asking
+    eight separate agents, on eight separate dispatches, whether the same line of
+    the same file was really a defect: 273 findings over 125 sites, 88 of them in
+    one file.
+
+    This returns the canonical each verifier should be given and the members that
+    inherit its verdict, so the phase can be run per site instead of per row. The
+    saving is the duplicate work and nothing else — every member keeps its own
+    id, its own record, and its own row in the report.
+    """
+    findings = findings_io.load_findings(results_dir)
+    groups = exact_site_groups(findings)
+    plan: list[dict] = []
+    for members in groups:
+        canonical = max(members, key=lambda f: (
+            1 if (f.get("poc") or {}).get("code") else 0,
+            1 if f.get("structural_probe") else 0,
+            _CONFIDENCE_RANK.get(str(f.get("confidence") or "").lower(), 0),
+            str(f.get("finding_id")),
+        ))
+        plan.append({
+            "site": f"{_norm_file(canonical.get('file'))}:{canonical.get('line_start')}",
+            "vuln_class": canonical.get("vuln_class"),
+            "canonical_id": canonical.get("finding_id"),
+            "member_ids": [f.get("finding_id") for f in members],
+            "independent_units": len(members),
+        })
+    return {
+        "findings": len(findings),
+        "verify_dispatches": len(plan),
+        "duplicate_dispatches_avoided": len(findings) - len(plan),
+        "window": VERIFY_WINDOW,
+        "grouping": "exact site: same file, same line span, same vuln_class",
+        "sites": plan,
+    }
+
+
+#: Confidence ordering for picking which member of an exact site a verifier reads.
+_CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
+
 #: Evidence rank for choosing the canonical. Higher wins.
 _OUTCOME_RANK = {
     "proven": 100,
@@ -187,10 +266,52 @@ _STRUCTURAL_RANK = {"demonstrated": 50, "inconclusive": 8, "probe_error": 2,
 _SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
 
-def _canonical_key(finding: dict) -> tuple:
+def verdict_of(record: Any) -> str:
+    """The phase 2c verdict string, from either record shape.
+
+    `phases/phase2c_verify.md` writes an envelope whose `verdict` key holds an
+    object; older records write the string directly. Both are read here so the
+    canonical choice cannot depend on which shape the verifier happened to
+    emit.
+    """
+    if not isinstance(record, dict):
+        return ""
+    inner = record.get("verdict")
+    if isinstance(inner, dict):
+        inner = inner.get("verdict")
+    return str(inner or "").strip().lower()
+
+
+def _deliverable_rank(finding: dict, verdicts: dict[str, str] | None) -> int:
+    """0 if `report_build.select_delivered` would withhold this record.
+
+    This is the first component of the canonical key, and it exists because of
+    a defect this ordering used to have. `select_delivered` withholds a
+    `rejected` finding, and separately withholds every non-canonical finding as
+    `duplicate_of_canonical`. So a group whose canonical the verifier rejected
+    disappears from the report *entirely* — taking a CONFIRMED sibling with it,
+    withheld twice for two different reasons, neither of which is "the evidence
+    was weak". On the recorded h2 run that happened at `settings.py:162-174`:
+    `g_0019` canonicalised the rejected `f_taint_06_1` over the confirmed
+    `f_sinkback_01_1`, and the site vanished.
+
+    A `proven` finding is never withheld — `select_delivered` delivers it
+    ahead of both checks — so it keeps rank 1 whatever the verifier concluded,
+    and rule 2's "proven beats everything" is unchanged. Only a finding that
+    is both unproven and rejected drops below its group.
+    """
+    execution = finding.get("execution") or {}
+    if bool(execution.get("proven")) or str(execution.get("outcome")) == "proven":
+        return 1
+    verdict = (verdicts or {}).get(str(finding.get("finding_id") or ""), "")
+    return 0 if verdict == "rejected" else 1
+
+
+def _canonical_key(finding: dict, verdicts: dict[str, str] | None = None) -> tuple:
     execution = finding.get("execution") or {}
     structural = finding.get("structural") or {}
     return (
+        _deliverable_rank(finding, verdicts),
         _OUTCOME_RANK.get(str(execution.get("outcome") or ""), 0),
         _STRUCTURAL_RANK.get(str(structural.get("outcome") or ""), 0),
         _SEVERITY_RANK.get(str(finding.get("severity") or "").lower(), 0),
@@ -208,11 +329,13 @@ def _inverse_id(finding_id: str) -> tuple:
     return tuple(-ord(ch) for ch in finding_id)
 
 
-def assign_groups(groups: Iterable[Sequence[dict]]) -> list[dict]:
+def assign_groups(groups: Iterable[Sequence[dict]],
+                  verdicts: dict[str, str] | None = None) -> list[dict]:
     """Stamp ``group_id`` / ``is_canonical`` / ``independent_units`` in place."""
     summary: list[dict] = []
     for index, group in enumerate(groups, 1):
-        ordered = sorted(group, key=_canonical_key, reverse=True)
+        ordered = sorted(group, key=lambda f: _canonical_key(f, verdicts),
+                         reverse=True)
         canonical = ordered[0]
         group_id = f"g_{index:04d}"
         units = sorted({str(f.get("task_id")) for f in group if f.get("task_id")})
@@ -239,6 +362,8 @@ def assign_groups(groups: Iterable[Sequence[dict]]) -> list[dict]:
             "line_start": canonical.get("line_start"),
             "class_family": class_family(canonical.get("vuln_class")),
             "canonical": canonical.get("finding_id"),
+            "canonical_verdict": (verdicts or {}).get(
+                str(canonical.get("finding_id") or "")) or None,
             "members": sorted(str(f.get("finding_id")) for f in group),
             "size": len(group),
             "independent_units": len(units) or 1,
@@ -251,8 +376,17 @@ def run(results_dir: str | Path, *, window: int = DEFAULT_WINDOW,
         write: bool = True) -> dict:
     results = Path(results_dir)
     findings = findings_io.load_findings(results)
+    # The verifier's verdicts are consulted for canonical choice only. Nothing
+    # here rejects, deletes or reorders a finding on a verdict; a rejected
+    # record stays in the group with its own file, PoC and verdict intact. It
+    # simply stops being the one the report renders when a deliverable sibling
+    # exists at the same site.
+    verdicts = {
+        finding_id: verdict_of(record)
+        for finding_id, record in findings_io.load_verifications(results).items()
+    }
     groups = group_findings(findings, window)
-    summary = assign_groups(groups)
+    summary = assign_groups(groups, verdicts)
 
     written = 0
     if write:
@@ -269,6 +403,11 @@ def run(results_dir: str | Path, *, window: int = DEFAULT_WINDOW,
         "collapsed": sum(row["size"] - 1 for row in summary),
         "sites_with_duplicates": len(multi),
         "sites_found_by_multiple_units": len(converged),
+        # Disclosed rather than assumed away: a site whose only records the
+        # verifier rejected is still rendered by its rejected canonical, and a
+        # reader should be able to count those without opening `verify/`.
+        "sites_canonicalised_by_a_rejected_finding": sum(
+            1 for row in summary if row.get("canonical_verdict") == "rejected"),
         "window": window,
         "written": written,
         "groups": summary,
@@ -319,6 +458,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     report_cmd = sub.add_parser("report", help="show the current grouping")
     report_cmd.add_argument("--results-dir", required=True)
+
+    verify_cmd = sub.add_parser(
+        "verify-plan",
+        help="one verification dispatch per EXACT site (same file, line and "
+             "class), with the members that inherit each verdict")
+    verify_cmd.add_argument("--results-dir", required=True)
     return parser
 
 
@@ -327,6 +472,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.cmd == "report":
             print(json.dumps(report(args.results_dir), indent=2))
+            return 0
+        if args.cmd == "verify-plan":
+            payload = verify_plan(args.results_dir)
+            print(json.dumps(payload, indent=2))
+            sys.stderr.write(
+                f"dedupe: {payload['findings']} finding(s) -> "
+                f"{payload['verify_dispatches']} verification dispatch(es); "
+                f"{payload['duplicate_dispatches_avoided']} duplicate "
+                f"dispatch(es) avoided, exact-site grouping only\n")
             return 0
         payload = run(args.results_dir, window=args.window, write=not args.dry_run)
         printable = {k: v for k, v in payload.items() if k != "groups"}

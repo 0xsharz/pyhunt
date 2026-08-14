@@ -10,9 +10,47 @@
 > `proven` finding carries a `rejected` verdict.
 
 Phase 2 produced candidates; phase 2b replayed their PoCs and attached an
-execution outcome to each. This phase runs a **fresh agent per finding whose job
-is to kill it**. One finding per agent, on a different model than the one that
-hunted it, with no Bash.
+execution outcome to each. This phase runs a **fresh agent per site whose job is
+to kill what stands there**. One site per agent, on a different model than the
+one that hunted it, with no Bash.
+
+### One dispatch per *exact site*, not per row
+
+The orchestrator builds the dispatch list with:
+
+```bash
+python3 "${PYHUNT_DIR}/scripts/dedupe.py" verify-plan --results-dir "${RESULTS_DIR}"
+```
+
+Each entry names a `canonical_id` to verify and the `member_ids` that inherit its
+verdict. Write `verify/<finding_id>.json` for **every** member — the canonical's
+argument, its `checked_lines`, and `verified_via: "<canonical_id>"` on the
+inheritors — so the phase gate ("every file in `findings/` has exactly one file
+in `verify/`") still holds exactly as written.
+
+**"Exact site" means same file, same line span, same `vuln_class` — nothing
+looser, and this is not a tunable.** Two findings that agree on all three are one
+line described twice by agents that could not see each other. `dedupe.py`'s
+windowed, class-family grouping is for the *report*, where every member already
+has its own verdict and grouping only decides presentation. Using it here would
+mean the group's canonical is the only member anyone reads, and a merge that is
+wrong would delete a finding instead of formatting one. On the RealVuln run
+`app/config.py:13` and `:15` were two different committed secrets that a window
+of 3 merged; had that grouping fed this phase, nobody would ever have read the
+second.
+
+Why this exists: phase 2's fan-out is per (class, location) and several blind
+units routinely land on the same line. On the dca-avroschema v3 run, 273 findings
+covered 203 exact sites — seven separate units filed on
+`model_generator/lang/python/base.py:240`, and asking seven agents the same
+question about the same line is not seven opinions, it is one opinion billed
+seven times. The convergence itself is kept: `independent_units` rides on the
+site and reaches the report.
+
+What does **not** change: every finding keeps its own id, its own record and its
+own row. Nothing is merged away, and §"Judge the finding, never the fact that a
+sibling exists" still governs — a *different* line, or the same line under a
+different class, is a different dispatch.
 
 `${PYHUNT_DIR}` is the skill directory, `${RESULTS_DIR}` the timestamped results
 directory, `${TARGET}` the repository under scan.
@@ -30,6 +68,37 @@ path, not the default one.
 
 You verify exactly one finding. You cannot emit new findings: if you notice an
 unrelated bug, ignore it. This phase exists to filter noise, not to expand it.
+
+## Judge the finding, never the fact that a sibling exists
+
+**A finding is confirmed or rejected on its own merits. "Another finding already
+covers this site" is NOT a ground for rejection.** If you notice the
+relationship, record it in `duplicate_of` and confirm or reject as you otherwise
+would.
+
+This rule exists because its absence corrupted two numbers at once on a real
+run. Roughly a third of that run's findings were the same few defects described
+from different lines — one stream leak appeared at five sites, one settings scan
+at two, one validation gap at four — and with no rule stated, verifiers split.
+Eight rejected duplicates outright; one confirmed and noted the relationship.
+Both readings are defensible, which is exactly why the phase file has to pick
+one.
+
+What the split cost:
+
+- **The rejection rate stopped meaning anything.** It is the health signal this
+  phase is judged by (~50% is normal), and it silently became a mixture of
+  false positives and duplicate framings. On that run: 23 rejections, of which
+  5 sat at a site that also held a confirmed record.
+- **It deleted corroboration.** `dedupe.py` collapses same-site findings to one
+  row *and records `independent_units`* — how many hunt agents reached that site
+  without seeing each other's work. Convergence is evidence. A verifier that
+  rejects a duplicate destroys it before `dedupe.py` ever runs, and the report
+  then understates how many independent agents found the same defect.
+
+Deduplication is **phase 3's** job, it happens on root cause, and it is designed
+to keep the convergence count while collapsing the rows. Do not do it here.
+
 
 > **One agent, one finding. Batching is not a cost optimisation here, it is a
 > loss of the control.** A real run batched up to five same-file findings per
@@ -166,6 +235,22 @@ image; a second execution here would launder the same evidence into what looks
 like an independent confirmation. Your independence comes from reading the code
 without the hunter's framing, on a different model.
 
+> **Orchestrator: dispatch this phase with an envelope that matches the line
+> above, and check both halves of it.** On a real run the dispatch delivered the
+> exact inverse — Bash present, `Grep` and `Glob` absent — and two verifiers
+> reported it: *"my toolset in this session had no standalone Grep/Glob;
+> ToolSearch found none"*. Both then reached for the shell, which is the only
+> search tool they had, and self-reported the violation afterwards. Nothing in
+> the pipeline noticed.
+>
+> The lesson is not "the agents disobeyed". It is that **an agent told to search
+> without a search tool will find one**, so a forbidden capability that is
+> available and a required capability that is missing are the same bug. Verify
+> the permitted tools are present, not only that the forbidden one is absent.
+>
+> If the harness cannot restrict tools per dispatch, record `tools_used` in each
+> verify record and treat any Bash use as grounds to re-run that verification.
+
 ## Output
 
 Write `${RESULTS_DIR}/verify/<finding_id>.json` with this envelope:
@@ -239,6 +324,31 @@ refuted it, is exactly the row a reader needs to see for themselves.
 This does not apply in reverse. A `rejected` verdict against a `demonstrated`
 probe is ordinary: `demonstrated` is corroboration, not proof, and a verifier is
 entitled to reject a corroborated finding on a scope or reachability ground.
+
+### A rejection of a `critical` or `high` finding gets a second verifier
+
+Two things about this phase pull in the same dangerous direction. Its model is
+deliberately *different* from the hunt's, which in practice often means cheaper
+and faster; and a rejection here is one of the few actions in the whole pipeline
+that removes a finding from the report. Nothing else in the design lets a single
+agent on a single read delete the run's most serious result.
+
+So when a verifier rejects a finding whose severity is `critical` or `high`, the
+orchestrator dispatches **one second verifier on the strongest model available**,
+handed the finding and the first rejection together, recording
+`second_verifier_of: "<finding_id>"`. Both verdicts are kept and the report shows
+the disagreement.
+
+This is bounded by construction: it fires only on rejections, only on the top two
+severities. On the dca-avroschema v3 run that ceiling is 110 of 273 findings, and
+only the fraction actually rejected pays anything — at the historical rejection
+rate, a few dispatches.
+
+The asymmetry is deliberate and it is the same one the whole tool is built on. A
+wrongly confirmed finding wastes a maintainer's afternoon and is visible to them
+the moment they read the code. A wrongly rejected `critical` is invisible: it
+leaves no row, no gap and no number, and the report reads exactly as it would
+have if the bug were not there.
 
 ## Method
 

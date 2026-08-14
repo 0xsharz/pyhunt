@@ -829,21 +829,41 @@ def resolve_run_secret(results_dir: Path, manifest: dict) -> tuple[str | None, s
     if existing:
         return existing, "environment"
 
-    for key in ("run_secret", "nonce_secret"):
-        value = manifest.get(key)
-        if isinstance(value, str) and value:
-            os.environ[_RUN_SECRET_ENV] = value
-            return value, f"manifest.json:{key}"
-
+    sidecar_value = None
     sidecar = Path(results_dir) / ".run_secret"
     try:
         if sidecar.is_file():
-            value = sidecar.read_text(encoding="utf-8").strip()
-            if value:
-                os.environ[_RUN_SECRET_ENV] = value
-                return value, ".run_secret"
+            sidecar_value = sidecar.read_text(encoding="utf-8").strip() or None
     except OSError:
-        pass
+        sidecar_value = None
+
+    for key in ("run_secret", "nonce_secret"):
+        value = manifest.get(key)
+        if not (isinstance(value, str) and value):
+            continue
+        # The sidecar is what `oracle.nonce.ensure_durable_secret` wrote at
+        # dispatch, so it is the key the PoCs were minted under. A manifest
+        # field that disagrees with it is not a second opinion — it is a
+        # different key, and every nonce derived from it fails gate condition 3
+        # while the run reports `sink_reached_unproven`, which reads as "the
+        # target defended itself". Observed: an orchestrator wrote the human
+        # note "<persisted at .run_secret, 0600>" into `manifest.json:run_secret`
+        # and 33 findings were judged against nonces no payload could contain.
+        if sidecar_value and value != sidecar_value:
+            raise SystemExit(
+                f"[replay] contract violation: manifest.json:{key} and "
+                f".run_secret hold different values. The PoCs were minted under "
+                f"the sidecar's key, so deriving nonces from the manifest's "
+                f"would make gate condition 3 unsatisfiable for every finding "
+                f"in this run. Remove the manifest field or make the two agree; "
+                f"do not let replay pick one."
+            )
+        os.environ[_RUN_SECRET_ENV] = value
+        return value, f"manifest.json:{key}"
+
+    if sidecar_value:
+        os.environ[_RUN_SECRET_ENV] = sidecar_value
+        return sidecar_value, ".run_secret"
     return None, "unavailable"
 
 
@@ -882,6 +902,15 @@ def resolve_image(manifest: dict, override: str | None) -> tuple[str | None, str
         value = provision.get("image_tag") or provision.get("image")
         if isinstance(value, str) and value:
             return value, "manifest.json:provision.image_tag"
+    # `sandbox.py up` writes its state under `sandbox.target_image`. It now also
+    # copies the tag to the top-level `image` key, but a manifest carrying only
+    # the nested form — an older run, or a state block merged in wholesale — is
+    # still a recorded image and must not read as an absent one.
+    sandbox = manifest.get("sandbox")
+    if isinstance(sandbox, dict):
+        value = (sandbox.get("target_image") or {}).get("image")
+        if isinstance(value, str) and value:
+            return value, "manifest.json:sandbox.target_image.image"
     return None, "unresolved"
 
 

@@ -24,7 +24,9 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import asdict, dataclass, field
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Protocol
 
@@ -40,7 +42,11 @@ log = logging.getLogger(__name__)
 
 DEFAULT_BUILD_TIMEOUT = 900       # seconds — a cold base-image pull is slow
 DEFAULT_VERIFY_TIMEOUT = 600
-DEFAULT_MAX_ATTEMPTS = 3          # 1 build + at most 2 repairs
+DEFAULT_MAX_ATTEMPTS = 4          # 1 build + at most 3 repairs
+# Not a rule in provision/repair.py's ladder: it needs the fingerprint and the
+# repo path, which a (dockerfile, log) transform does not get. It is applied by
+# provision_environment and named here so the two agree on one spelling.
+_FALLBACK_RULE = "fallback_to_generated_recipe"
 LOG_TAIL_CHARS = 4000             # what we keep of a (possibly huge) build log
 
 # Container resource caps for the verify step. Deliberately modest: verification
@@ -284,6 +290,85 @@ def _recipe_dockerfile(recipe: RenderedRecipe, repo_path: Path) -> tuple[str | N
     return None, "no build recipe to build"
 
 
+_DEP_MANIFESTS = (
+    "requirements.txt", "requirements/*.txt", "requirements/*.in",
+    "requirements-*.txt", "pyproject.toml", "setup.py", "setup.cfg",
+    "Pipfile", "Pipfile.lock", "poetry.lock", "uv.lock", "package.json",
+    "go.mod", "go.sum", "pom.xml", "build.gradle", "Gemfile",
+)
+
+
+def _dockerignore_hidden_manifests(repo_path: Path) -> tuple[list[str], list[str]]:
+    """Dependency manifests that exist in the repo but that its `.dockerignore`
+    keeps out of the build context, and the patterns responsible.
+
+    A repo's `.dockerignore` is written for the repo's own build, and that
+    build often has a step the provisioner does not run. A pip-tools project
+    ignores `requirements/*.in` because its Makefile compiles them to pinned
+    `.txt` files first; adopting the ignore file verbatim therefore produces a
+    context with no dependency declarations in it at all, an image with none of
+    the target's dependencies installed, and a PoC that fails on
+    `ModuleNotFoundError` for an environment reason. Observed exactly that way
+    on a FastAPI target whose `.dockerignore` listed `*.txt` and
+    `requirements/*.in`.
+
+    Matching is fnmatch over the pattern and over its `**/`-stripped form,
+    which is close enough to Docker's rules for the manifest names above.
+    """
+    ignore_file = repo_path / ".dockerignore"
+    if not ignore_file.is_file():
+        return [], []
+    try:
+        patterns = [
+            ln.strip() for ln in ignore_file.read_text(
+                encoding="utf-8", errors="replace").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+            and not ln.strip().startswith("!")
+        ]
+    except OSError:
+        return [], []
+
+    present: list[str] = []
+    for glob in _DEP_MANIFESTS:
+        present += [
+            p.relative_to(repo_path).as_posix()
+            for p in repo_path.glob(glob) if p.is_file()
+        ]
+
+    hidden, culprits = [], []
+    for rel in sorted(set(present)):
+        for pat in patterns:
+            bare = pat[3:] if pat.startswith("**/") else pat
+            if (fnmatch(rel, pat) or fnmatch(rel, bare)
+                    or fnmatch(Path(rel).name, bare)
+                    or rel.startswith(pat.rstrip("/") + "/")):
+                hidden.append(rel)
+                if pat not in culprits:
+                    culprits.append(pat)
+                break
+    return hidden, culprits
+
+
+def _context_with_manifests(repo_path: Path, culprits: list[str]) -> Path:
+    """A throwaway copy of the build context whose `.dockerignore` no longer
+    excludes dependency manifests. The target repository is never written to —
+    `repo_guard.py` asserts that, and the honest way to change what Docker sees
+    is to change the copy."""
+    tmp = Path(tempfile.mkdtemp(prefix="pyhunt-ctx-")) / "ctx"
+    shutil.copytree(repo_path, tmp, ignore=shutil.ignore_patterns(".git"),
+                    symlinks=True)
+    di = tmp / ".dockerignore"
+    if di.is_file():
+        kept = [
+            ln for ln in di.read_text(encoding="utf-8", errors="replace").splitlines()
+            if ln.strip() not in culprits
+        ]
+        kept.append("# pyhunt: patterns hiding dependency manifests removed — "
+                    + ", ".join(culprits))
+        di.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    return tmp
+
+
 def _verify(client: DockerClient, tag: str, recipe: RenderedRecipe, *,
             timeout: int, network: str, workdir: str) -> VerifyResult:
     """Prove the image is actually usable: the dependency probe first (the
@@ -386,8 +471,29 @@ def provision_environment(
     applied: set[str] = set()
     pending_rule: str | None = None
 
+    build_context = repo_path
+    scratch_context: Path | None = None
+    hidden, culprits = _dockerignore_hidden_manifests(repo_path)
+    if hidden:
+        try:
+            scratch_context = _context_with_manifests(repo_path, culprits)
+            build_context = scratch_context
+            result.notes.append(
+                "the target's .dockerignore excluded "
+                f"{len(hidden)} dependency manifest(s) ({', '.join(hidden[:5])}"
+                f"{'…' if len(hidden) > 5 else ''}) via {', '.join(culprits)}; "
+                "built from a copy of the context with those patterns removed "
+                "— the target repository itself is untouched"
+            )
+        except OSError as e:
+            result.notes.append(
+                "the target's .dockerignore excludes dependency manifests "
+                f"({', '.join(culprits)}) and the context copy failed ({e}); "
+                "the image may be INCOMPLETE"
+            )
+
     for n in range(1, max(1, max_attempts) + 1):
-        r = client.build(context=repo_path, dockerfile=dockerfile,
+        r = client.build(context=build_context, dockerfile=dockerfile,
                          tag=result.image_tag, timeout=build_timeout)
         result.attempts.append(BuildAttempt(
             attempt=n, ok=r.ok, exit_code=r.exit_code, timed_out=r.timed_out,
@@ -407,6 +513,36 @@ def provision_environment(
             result.notes.append(f"build failed after {n} attempt(s)")
             break
         fix = repair_dockerfile(dockerfile, r.log, already_applied=frozenset(applied))
+
+        # The repo's own Dockerfile is the highest-signal recipe and the wrong
+        # thing to keep patching once it has failed for a reason no rule
+        # recognises, or once the only rule left is "make the install
+        # non-fatal". Both endings hand the pipeline an image holding the
+        # target's source and none of its dependencies, which is the shape
+        # every PoC then fails against for an environment reason. Re-render
+        # from the fingerprint instead: the templated recipe is written to
+        # tolerate what a vendored one assumes.
+        if (recipe.source == "existing"
+                and _FALLBACK_RULE not in applied
+                and (fix is None or fix.rule == "soften_install_step")):
+            alt = render_dockerfile(fp, repo_path, ignore_existing=True)
+            alt_dockerfile, _ = _recipe_dockerfile(alt, repo_path)
+            if alt_dockerfile:
+                dockerfile = alt_dockerfile
+                recipe = alt
+                result.source = alt.source
+                result.build_cmd = alt.build_cmd
+                result.test_cmd = alt.test_cmd
+                applied.add(_FALLBACK_RULE)
+                pending_rule = _FALLBACK_RULE
+                result.dockerfile = dockerfile
+                note = (f"repair[{_FALLBACK_RULE}]: the repo's own Dockerfile "
+                        "could not be repaired; rebuilt from PyHunt's templated "
+                        f"recipe ({'; '.join(alt.notes) or alt.source})")
+                result.notes.append(note)
+                log.info("[provision] build attempt %d failed -> repair %s", n, _FALLBACK_RULE)
+                continue
+
         if fix is None:
             result.status = "failed"
             # Quote the decisive line. This used to say "see the last attempt
@@ -451,4 +587,6 @@ def provision_environment(
                 "verify: the ecosystem build command failed inside the image — "
                 "the environment may be INCOMPLETE"
             )
+    if scratch_context is not None:
+        shutil.rmtree(scratch_context.parent, ignore_errors=True)
     return result

@@ -185,10 +185,27 @@ PYTHON_SINKS: dict[str, list[re.Pattern]] = {
             r"HttpResponseRedirect\s*\(",
         )
     ],
+    # CWE-117. The sink is *eager* interpolation of untrusted text into the log
+    # message — an f-string, a `%`/`.format()` applied before the call, or a
+    # concatenation — because that is what lets a CR/LF in the value forge a
+    # second log record.
+    #
+    # The pattern used to be `logger.<level>(...%...)`, which matches
+    # `logger.debug("Stream ID %d created", stream_id)`. That is *lazy* logging:
+    # the `%` is a placeholder the logging module fills in itself, it is the
+    # form the stdlib documentation tells you to use, and it is not a sink. The
+    # cost was not abstract — on h2 it produced eleven matches inside the
+    # analysis scope, every one of them false, and because a sink claims its
+    # enclosing function, those eleven were competing for the same task budget
+    # as the real unbounded-growth sinks in the same functions. A pattern that
+    # fires on correct code does not merely add noise; it displaces signal.
     "log_injection": [
         re.compile(p)
         for p in (
-            r"log(?:ging|ger)?\.(?:info|warning|warn|error|debug|critical|exception)\s*\([^)]*%",
+            r"log(?:ging|ger)?\.(?:info|warning|warn|error|debug|critical|exception)\s*\(\s*f['\"]",
+            r"log(?:ging|ger)?\.(?:info|warning|warn|error|debug|critical|exception)\s*\([^)]*['\"]\s+%\s+[\w(]",
+            r"log(?:ging|ger)?\.(?:info|warning|warn|error|debug|critical|exception)\s*\([^)]*\.format\s*\(",
+            r"log(?:ging|ger)?\.(?:info|warning|warn|error|debug|critical|exception)\s*\([^)]*['\"]\s*\+\s*\w",
         )
     ],
     "information_disclosure": [
@@ -201,6 +218,84 @@ PYTHON_SINKS: dict[str, list[re.Pattern]] = {
             # secret is actually reachable in the printed expression.
             r"traceback\.(?:format_exc|format_exception|print_exc)\s*\(",
             r"\.format_exc\s*\(",
+        )
+    ],
+    # -----------------------------------------------------------------------
+    # STATE AND RESOURCE SINKS.
+    #
+    # Every class above is an *injection* class: attacker text crosses into an
+    # interpreter — a shell, a parser, a query planner, a source file. That is
+    # the entire vocabulary of the table, and on a whole category of target it
+    # describes nothing that is there.
+    #
+    # A sans-IO protocol library is the clean case. `python-hyper/h2` owns no
+    # socket, no filesystem and no subprocess; grepping its twelve source files
+    # for eval/exec/pickle/yaml.load/os.system/subprocess/open/socket/requests
+    # returns ZERO hits, and that is a true fact about the library rather than a
+    # gap in the search. Run the table above against it and the only matches are
+    # false: `def open(self)` (a state-machine property, matched by the
+    # path_traversal `open(` pattern) and eleven `logger.debug("...%s", arg)`
+    # calls. A generator that stops there queues nothing real and the run
+    # reports a clean protocol implementation — the exact shape of failure this
+    # project refuses to ship, arrived at honestly.
+    #
+    # What is dangerous in that code is not interpretation, it is accumulation:
+    # a container the peer can grow without bound, a per-frame walk over
+    # everything accumulated so far, an accounting variable the peer can drive
+    # past its guard. Those are CWE-400 / CWE-770 / CWE-407 / CWE-190, they are
+    # where this library's actual CVE history lives, and none of them has an
+    # eval-shaped pattern.
+    #
+    # These three classes are appended LAST on purpose. `find_sinks` takes the
+    # first matching class per line in table order, so nothing here can steal a
+    # line from an injection class above: `self.cache[k] = subprocess.run(...)`
+    # is still command_injection. They can only add coverage.
+    #
+    # Noise was measured, not assumed — over two unrelated Python targets these
+    # patterns produce 31 sinks across h2's 12 files and 12 across a 90-file
+    # code-generation library, which is the density an authored table wants.
+    # -----------------------------------------------------------------------
+    #
+    # CWE-400/CWE-770. Growth an attacker drives and nothing bounds. The
+    # question the hunter must answer at each of these is the same one: what
+    # caps this, and can a peer reach it faster than the cap sweeps it? h2's
+    # `self.streams[stream_id] = s` is the archetype — the dict has no cap at
+    # all, and closed entries are reclaimed only as a side effect of somebody
+    # reading an `open_*_streams` property.
+    "resource_exhaustion": [
+        re.compile(p)
+        for p in (
+            # Insertion into an instance-owned container at a caller-chosen key.
+            r"self\.\w+\[[^\]\n]{1,60}\]\s*=(?!=)",
+            # An unbounded deque. `maxlen=` is the cap, and its absence is the
+            # finding — same doctrine as the SafeLoader and weights_only=True
+            # exemptions above: match the dangerous configuration, not the API.
+            r"\bdeque\s*\((?![^)\n]*maxlen)",
+            # Append to an instance-owned container.
+            r"self\.\w+\.append\s*\(",
+            # A named accumulator that only ever grows on the receive path.
+            r"self\.\w*(?:data|buf|buffer|queue|pending|backlog|frames|events)"
+            r"\w*\s*\+=",
+        )
+    ],
+    # CWE-407. Superlinear work per attacker-supplied item. A full walk of an
+    # instance container is O(n); reached once per inbound message it is O(n^2)
+    # over a connection, and the peer chooses n.
+    "algorithmic_complexity": [
+        re.compile(p)
+        for p in (
+            r"for\s+\w+(?:\s*,\s*\w+)*\s+in\s+self\._?\w+"
+            r"(?:\.(?:items|values|keys)\s*\(\))?\s*:",
+        )
+    ],
+    # CWE-190/CWE-191. Accounting the peer drives. Flow-control windows, sizes
+    # and counters that are incremented or decremented from wire values are
+    # where a protocol implementation over- or under-flows its own guard.
+    "integer_overflow": [
+        re.compile(p)
+        for p in (
+            r"self\.\w*(?:window|size|count|remaining|budget|processed|length)"
+            r"\w*\s*[-+*]=",
         )
     ],
 }
@@ -412,11 +507,30 @@ def _file_language(graph: "GraphQuery", rel_file: str) -> str | None:
     return EXT_TO_LANG.get(PurePosixPath(rel_file).suffix.lower())
 
 
-def _files_by_lang(graph: "GraphQuery") -> list[tuple[str, str]]:
+def in_scope(rel_file: str, scope: tuple[str, ...] | None) -> bool:
+    """Whether `rel_file` lies inside the run's declared analysis scope.
+
+    `scope` is the repo-relative prefix list from `manifest.json` /
+    `inputs.json`'s ``target_scope`` (e.g. ``("src/h2",)``). ``None`` or empty
+    means the whole repository, which is the historical behaviour and stays the
+    default for every run that does not declare a scope.
+    """
+    if not scope:
+        return True
+    norm = rel_file.replace("\\", "/")
+    return any(norm == p or norm.startswith(p.rstrip("/") + "/") for p in scope)
+
+
+def _files_by_lang(
+    graph: "GraphQuery", scope: tuple[str, ...] | None = None,
+) -> list[tuple[str, str]]:
     """Every graph file paired with a language that HAS a sink table.
-    Files with no table (or unknown language) are dropped."""
+    Files with no table (or unknown language) are dropped, as are files outside
+    the declared analysis scope."""
     out: list[tuple[str, str]] = []
     for f in graph._by_file:
+        if not in_scope(f, scope):
+            continue
         lang = _file_language(graph, f)
         if lang in SINKS_BY_LANG:
             out.append((f, lang))
@@ -431,14 +545,21 @@ def _read_static(repo_path: Path, rel_file: str) -> str | None:
         return None
 
 
-def find_sinks(repo_path: Path, graph: "GraphQuery") -> list[Sink]:
+def find_sinks(
+    repo_path: Path, graph: "GraphQuery", scope: tuple[str, ...] | None = None,
+) -> list[Sink]:
     """Scan the graph's files for dangerous-API lines, tagging each with its
     attack class and enclosing symbol. Language-parametric: each file is
     matched against the sink table for ITS language (SINKS_BY_LANG). Python
     behavior is unchanged. Deterministic and static-only.
+
+    `scope` restricts the scan to the run's declared analysis scope. A sink in
+    an example server or a test fixture is not a sink in the library the run
+    says it is auditing, and a task spent on one is budget the declared scope
+    does not get back.
     """
     sinks: list[Sink] = []
-    for rel_file, lang in _files_by_lang(graph):
+    for rel_file, lang in _files_by_lang(graph, scope):
         table = SINKS_BY_LANG[lang]
         text = _read_static(repo_path, rel_file)
         if text is None:
@@ -520,6 +641,7 @@ def build_taint_tasks(
     *,
     max_tasks: int = 40,
     max_hops: int = 8,
+    scope: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Emit one ``hunt_task`` dict per reachable ``(input → sink)`` call-graph
     path. Never raises for empty/degenerate input — returns ``[]``.
@@ -539,15 +661,57 @@ def build_taint_tasks(
         return []
 
     # 2. sinks
-    sinks = find_sinks(repo_path, graph)
+    sinks = find_sinks(repo_path, graph, scope)
     if not sinks:
         return []
+    # One sink per (enclosing symbol, attack class) — the same granularity
+    # `build_sink_backward_tasks` uses, so the two sources describe loci the
+    # same way. A task is "one attack class, one location", and a function is
+    # the location: `Settings.__init__` opens six unbounded deques on six
+    # consecutive lines, which is one unbounded-settings finding, not six, and
+    # emitting six spends six of the forty task slots re-asking one question.
+    # Distinct classes in one function still get one task each — h2's
+    # `_open_streams` is both an O(n) walk and an unbounded insert, and those
+    # are two different bugs in two different sentences.
     sinks_by_id: dict[str, list[Sink]] = defaultdict(list)
+    seen_class: set[tuple[str, str]] = set()
     for s in sinks:
+        key = (s.symbol_id, s.attack_class)
+        if key in seen_class:
+            continue
+        seen_class.add(key)
         sinks_by_id[s.symbol_id].append(s)
 
     # 3. reachability (ported BFS)
     paths = graph.taint_paths(entry_ids, list(sinks_by_id.keys()), max_hops)
+
+    # 3b. Zero-hop flows: a sink INSIDE a function that is itself an entry.
+    #
+    # `taint_paths` seeds `visited` with every entry and records a sink only
+    # when it is discovered as a *callee*, so a sink whose enclosing symbol is
+    # an entry is structurally unreachable — the BFS marks it visited before it
+    # starts. The donor documents this ("an entry that is itself a sink is not
+    # recorded"), and on a service with a thin handler layer over a deep call
+    # tree it costs nothing, because handlers rarely hold the sink themselves.
+    #
+    # On a protocol library it costs almost everything, and it gets worse the
+    # BETTER phase 1 did its job. h2 is twelve files; a thorough inventory
+    # resolved 110 distinct entry symbols across them, which is most of the
+    # functions in the library — so 29 of the 32 sink symbols were also entry
+    # symbols, and forward taint reported 2 paths out of 32 available. The
+    # source the phase file ranks first, and the only one that hands the hunter
+    # source and sink in one context, was silenced by the inventory being good.
+    #
+    # A same-function flow is not a weaker finding than a five-hop one. It is
+    # the same finding with nothing in between to sanitise it, which makes it
+    # the easiest to confirm and the hardest to argue with. It is emitted here
+    # as a one-node path rather than by changing the shared BFS primitive,
+    # which other phases also call.
+    entry_id_set = set(entry_ids)
+    paths = list(paths) + [
+        (sink_id, [sink_id]) for sink_id in sinks_by_id
+        if sink_id in entry_id_set
+    ]
 
     # 4. emit
     tasks: list[dict] = []
@@ -562,7 +726,22 @@ def build_taint_tasks(
             target_files = _target_files(graph, path, entry, sink)
             if not target_files:
                 continue
-            key = (entry.symbol_id, sink_id, frozenset(target_files))
+            # Keyed on the SINK, not on its enclosing symbol. `sinks_by_id`
+            # holds every sink in a function, but the key used to read
+            # `sink_id` — the symbol — so the second and later sinks in any one
+            # function were dropped after the first had claimed the slot. The
+            # loop looked like it emitted a task per sink and emitted one per
+            # function, silently.
+            #
+            # It collapses exactly the distinction a task is supposed to carry.
+            # h2's `_begin_new_stream` holds a `logger.debug("...%s")` on line
+            # 505 and the unbounded `self.streams[stream_id] = s` on line 508;
+            # under the old key the log_injection match won on line order and
+            # the unbounded-growth sink — the real one — was never queued. One
+            # attack class and one location per task is the contract, so the
+            # class and the line belong in the identity.
+            key = (entry.symbol_id, sink_id, sink.line, sink.attack_class,
+                   frozenset(target_files))
             if key in seen:
                 continue
             seen.add(key)
@@ -634,14 +813,15 @@ def build_sink_backward_tasks(
     *,
     max_tasks: int = 20,
     max_back_hops: int = 3,
+    scope: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Emit one backward ``hunt_task`` per **orphan sink symbol** — a dangerous
     sink that NO enumerated input reaches forward. Never raises for
     empty/degenerate input — returns ``[]``.
 
     Steps (per the F3 brief):
-      1. Scan for sinks (``find_sinks``); pick one representative per enclosing
-         symbol (first-seen wins).
+      1. Scan for sinks (``find_sinks``); pick one representative per
+         (enclosing symbol, attack class) — first-seen wins.
       2. Resolve F1 entry symbols (``_entry_ids``) and run the forward BFS
          (``taint_paths``) to learn which sink symbols are already reached.
       3. ``orphans = sinks whose symbol is NOT forward-reached`` (disjoint from
@@ -649,25 +829,44 @@ def build_sink_backward_tasks(
       4. For each orphan: gather its backward-reachable callers
          (``callers_within``), map to files, and emit a priority-2
          ``source="sink_backward"`` task naming it an orphan sink.
-      Dedup by symbol, cap at ``max_tasks``.
+      Dedup by (symbol, class), cap at ``max_tasks``.
     """
     # 1. sinks — one representative per enclosing symbol (deterministic order).
-    sinks = find_sinks(repo_path, graph)
+    sinks = find_sinks(repo_path, graph, scope)
     if not sinks:
         return []
-    sink_by_symbol: dict[str, Sink] = {}
+    # One representative per (symbol, attack class) — not per symbol. A
+    # function that both logs and grows an unbounded container carries two
+    # different dangerous properties, and a task naming only the first is a
+    # task about the wrong bug. Deterministic: first line of each class wins.
+    sink_by_key: dict[tuple[str, str], Sink] = {}
     for s in sinks:
-        sink_by_symbol.setdefault(s.symbol_id, s)
+        sink_by_key.setdefault((s.symbol_id, s.attack_class), s)
+    sink_by_symbol: dict[str, Sink] = {}
+    for (symbol_id, _cls), s in sink_by_key.items():
+        sink_by_symbol.setdefault(symbol_id, s)
     sink_ids = list(sink_by_symbol)
 
     # 2. which sink symbols are already reached FORWARD from an F1 input.
+    #    A sink whose enclosing symbol IS an entry counts as reached: forward
+    #    taint now emits a zero-hop task for exactly those (see build_taint_tasks
+    #    step 3b), and this set is what keeps the two sources disjoint. Omitting
+    #    it would re-queue all 29 of h2's same-symbol sinks here as "orphans" —
+    #    duplicating a task already generated, and mislabelling a sink that an
+    #    enumerated input demonstrably reaches as one that nothing reaches.
     entry_ids = _entry_ids(graph, inputs)
     reached: set[str] = set()
     if entry_ids:
         reached = {sid for sid, _ in graph.taint_paths(entry_ids, sink_ids, max_hops=8)}
+        reached |= set(sink_ids) & set(entry_ids)
 
     # 3. orphans = all sinks − forward-reached (the disjointness property).
-    orphans = [sink_by_symbol[sid] for sid in sink_ids if sid not in reached]
+    #    Reachability is a property of the SYMBOL — the BFS walks call edges,
+    #    which do not know about lines — but the task is about the sink, so a
+    #    symbol that is not reached contributes one orphan per distinct class
+    #    it carries rather than one orphan total.
+    orphans = [s for (symbol_id, _cls), s in sink_by_key.items()
+               if symbol_id not in reached]
     if not orphans:
         return []
 

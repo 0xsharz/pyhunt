@@ -174,6 +174,42 @@ def _task_id(task: Mapping[str, Any]) -> str:
     return tid if isinstance(tid, str) and tid else "<unnamed task>"
 
 
+#: Sources whose tasks are *created because an input was uncovered*. Crediting
+#: coverage from one of these before it has run is circular — see
+#: :func:`_is_unrun_requeue`.
+RECALL_SOURCES = frozenset({"reconcile", "dismissal", "probe_gap"})
+
+
+def _is_unrun_requeue(
+    task: Mapping[str, Any], hunted_task_ids: frozenset[str]
+) -> bool:
+    """True for a re-queue task that has not been hunted yet.
+
+    This closes a circularity that silently reported a complete scan. The
+    sequence `phase3_sweep.md` prescribes is classify → reconcile → classify,
+    and `_synthesize_reconcile_task` writes the uncovered input's own entry
+    point verbatim into the new task's `scope_hint`. The entry-point rule below
+    then matched that task and marked the input **covered** — on the strength of
+    a task created *because* it was uncovered, which nobody had run.
+
+    Measured on a real run: an honest ledger of 146 covered / 7 uncovered became
+    153 / 0 on the second classify, with evidence strings reading
+    ``task t_rc_1 scope references '_error_code_from_int'``. The phase 3 agent
+    caught it and declined to re-run the step; nothing in the code stopped it.
+
+    `lens_matrix` (`dismissal`) and `coverage probe-gap` (`probe_gap`) have the
+    same shape — both re-queue a surface precisely because the first pass did
+    not settle it — so all three sources are excluded until a ledger says they
+    ran.
+
+    A re-queue task that *has* run is fine and is credited normally: the point
+    is not the source, it is whether the work happened.
+    """
+    if str(task.get("source") or "") not in RECALL_SOURCES:
+        return False
+    return _task_id(task) not in hunted_task_ids
+
+
 def _classify_input(
     inp: Mapping[str, Any],
     finding_basenames: set[str],
@@ -219,6 +255,8 @@ def _classify_input(
     entry = entry.strip() if isinstance(entry, str) else ""
     if entry:
         for t in tasks:
+            if _is_unrun_requeue(t, hunted_task_ids):
+                continue
             if entry in _task_haystack(t):
                 return "covered", f"task {_task_id(t)} scope references '{entry}'"
     return "uncovered", "no finding file or task scope reached this input"
@@ -369,6 +407,41 @@ def load_task_outcomes(results_dir: Path) -> dict[str, list[dict]]:
         if isinstance(entry, Mapping) and entry.get("task_id"):
             out.setdefault(str(entry["task_id"]), []).append(dict(entry))
     return out
+
+
+def load_completed_task_ids(results_dir: Path) -> tuple[frozenset[str], bool]:
+    """Task ids belonging to phase 2 units that actually **completed**.
+
+    Returns ``(ids, ledger_present)``. ``ledger_present`` is False when
+    ``logs/hunt/dispatch.json`` is missing or unreadable, which a caller must
+    treat as *unknown*, never as *nothing ran*.
+
+    `phase2_hunt.md` §8 states the rule this implements: "only a unit with
+    ``status: "completed"`` may contribute coverage", and notes that a truncated
+    or failed unit's `inputs_covered` records what it *would* have covered. That
+    rule was written down and never wired up — `coverage.py` only knew about the
+    `task-done` outcomes file, which no phase writes during a normal run. So on
+    every real run the hunted set was empty and the ledger fell back to matching
+    task *scopes*, which cannot distinguish a task that ran from one that was
+    merely written.
+    """
+    path = Path(results_dir) / "logs" / "hunt" / "dispatch.json"
+    try:
+        payload = _read_json(path)
+    except ContractViolation:
+        return frozenset(), False
+    if not isinstance(payload, Mapping):
+        return frozenset(), False
+    ids: set[str] = set()
+    for unit in payload.get("units") or []:
+        if not isinstance(unit, Mapping):
+            continue
+        if str(unit.get("status") or "") != "completed":
+            continue
+        for tid in unit.get("task_ids") or []:
+            if tid:
+                ids.add(str(tid))
+    return frozenset(ids), True
 
 
 def load_inputs(results_dir: Path) -> tuple[list[Any], list[str]]:
@@ -590,7 +663,15 @@ def build_coverage(results_dir: Path, *, cap: int = RECONCILE_CAP) -> dict[str, 
     basenames, finding_files, finding_notes = load_finding_basenames(results_dir)
     notes = [*input_notes, *task_notes, *finding_notes]
 
-    hunted = frozenset(load_task_outcomes(results_dir))
+    completed, ledger_present = load_completed_task_ids(results_dir)
+    hunted = frozenset(load_task_outcomes(results_dir)) | completed
+    if not ledger_present:
+        notes.append(
+            "logs/hunt/dispatch.json is absent, so which tasks actually ran is "
+            "UNKNOWN; re-queue tasks (reconcile/dismissal/probe_gap) are "
+            "excluded from coverage regardless, but a task that ran and one "
+            "that was only written cannot otherwise be told apart here"
+        )
     ledger, unreadable = classify_inputs(inputs, basenames, tasks, hunted)
     covered = sum(1 for row in ledger if row["disposition"] == "covered")
     uncovered = len(ledger) - covered
@@ -607,6 +688,24 @@ def build_coverage(results_dir: Path, *, cap: int = RECONCILE_CAP) -> dict[str, 
             + (" …" if len(duplicates) > 10 else "")
         )
 
+    # How each credit was earned. "Covered" is not one thing: a finding citing
+    # the input's own file is strong, a repo-wide lens-sweep task whose scope
+    # mentions its entry point is weak, and a single number hides the
+    # difference. On one run three specialist units legitimately named every
+    # file in scope, so 149 of 153 inputs matched on scope alone — a true
+    # number that does not mean what a reader will take it to mean.
+    by_rule: Counter[str] = Counter()
+    for row in ledger:
+        evidence = str(row.get("evidence") or "")
+        if row["disposition"] != "covered":
+            by_rule["uncovered"] += 1
+        elif evidence.startswith("finding touches"):
+            by_rule["finding_cites_this_file"] += 1
+        elif "was hunted" in evidence:
+            by_rule["hunted_task_named_this_input"] += 1
+        else:
+            by_rule["task_scope_mentions_entry_point"] += 1
+
     return {
         "inputs": ledger,
         "totals": {
@@ -614,10 +713,19 @@ def build_coverage(results_dir: Path, *, cap: int = RECONCILE_CAP) -> dict[str, 
             "covered": covered,
             "uncovered": uncovered,
         },
+        # Beside `totals`, not inside it: `totals` is compared exactly by
+        # tests and read by report_build, and widening it silently would be
+        # the same shape of breakage this file is trying to fix.
+        "coverage_by_rule": dict(by_rule),
         "reconcile": plan,
         "unreadable_input_records": unreadable,
         "duplicate_input_ids": duplicates,
         "seen": {"tasks": len(tasks), "finding_files": finding_files},
+        "hunted": {
+            "ledger_present": ledger_present,
+            "completed_task_ids": len(completed),
+            "outcome_task_ids": len(load_task_outcomes(results_dir)),
+        },
         "notes": notes,
     }
 
@@ -984,7 +1092,13 @@ def read_ledger(results_dir: Path) -> dict[str, Any]:
 
     rows: list[dict[str, Any]] = []
     unread_files: set[str] = set()
+    unknown_files: set[str] = set()
     fully_read = 0
+    # A file some finding cites was demonstrably opened, whatever the (absent)
+    # self-report says. This is the only positive evidence available when no
+    # unit declares `files_read`, and it is what keeps the "unknown" list from
+    # naming files the run visibly analysed.
+    cited_basenames, _cited_count, _cited_notes = load_finding_basenames(results_dir)
     for task in tasks:
         task_id = str(task.get("task_id") or "")
         assigned = {
@@ -995,13 +1109,20 @@ def read_ledger(results_dir: Path) -> dict[str, Any]:
             continue
         opened = by_task.get(task_id)
         if opened is None:
+            # UNKNOWN, not unread. These are different claims and conflating
+            # them made this report assert the opposite of what happened: with
+            # no hunt unit declaring `files_read` (none currently does), every
+            # task landed here and the command announced "12 file(s) assigned
+            # and never opened" — listing every in-scope file — on a run whose
+            # 53 findings cited line ranges in 8 of them.
             rows.append({
                 "task_id": task_id,
                 "assigned": sorted(assigned),
-                "unread": sorted(assigned),
+                "unread": [],
+                "unknown": sorted(assigned),
                 "status": "not_reported",
             })
-            unread_files |= assigned
+            unknown_files |= assigned
             continue
         missing = assigned - opened
         if missing:
@@ -1015,22 +1136,44 @@ def read_ledger(results_dir: Path) -> dict[str, Any]:
         else:
             fully_read += 1
 
+    def _cited(path: str) -> bool:
+        return path.rsplit("/", 1)[-1] in cited_basenames
+
+    demonstrably_read = sorted(p for p in unknown_files if _cited(p))
+    unknown_files = {p for p in unknown_files if not _cited(p)}
+
+    not_reporting = sum(1 for r in rows if r["status"] == "not_reported")
     payload: dict[str, Any] = {
         "tasks_with_targets": sum(1 for t in tasks if t.get("target_files")),
         "tasks_fully_read": fully_read,
         "tasks_partially_read": sum(1 for r in rows if r["status"] == "partial"),
-        "tasks_not_reporting": sum(1 for r in rows if r["status"] == "not_reported"),
+        "tasks_not_reporting": not_reporting,
+        # Known unread: a unit reported what it opened and this was not in it.
         "unread_files": sorted(unread_files),
+        # Unknown: assigned, nobody reported, and no finding cites them.
+        "unknown_files": sorted(unknown_files),
+        # Assigned by a silent task but cited by a finding, so read regardless.
+        "files_read_per_findings": demonstrably_read,
+        "reporting_available": bool(by_task),
         "rows": rows,
         "notes": notes,
     }
     if silent:
         payload["outputs_without_files_read"] = sorted(set(silent))[:50]
+    if not by_task:
+        payload["notes"] = list(notes) + [
+            "no hunt unit declared `files_read`, so per-task read coverage is "
+            "UNKNOWN rather than zero; `unread_files` is empty by construction "
+            "here and `unknown_files` is the honest list"
+        ]
     payload["interpretation"] = (
         "A file in scope and never opened is a gap with a name. This is a "
         "report, not a gate: failing a run for an unread file would push units "
         "toward inflating the list, which converts a measurable gap into an "
-        "unmeasurable one."
+        "unmeasurable one. `unread_files` and `unknown_files` are kept apart on "
+        "purpose — merging them once made this command claim every in-scope "
+        "file was never opened on a run that had produced findings citing line "
+        "ranges in most of them."
     )
     return payload
 
@@ -1266,14 +1409,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"results directory {results_dir} does not exist"
                 )
             payload = read_ledger(results_dir)
-            print(
-                f"coverage: {payload['tasks_fully_read']} task(s) read every "
-                f"assigned file, {payload['tasks_partially_read']} partially, "
-                f"{payload['tasks_not_reporting']} reported nothing; "
-                f"{len(payload['unread_files'])} file(s) assigned and never "
-                f"opened",
-                file=sys.stderr,
-            )
+            if not payload["reporting_available"]:
+                print(
+                    "coverage: no hunt unit declared `files_read`, so per-task "
+                    "read coverage is UNKNOWN, not zero. "
+                    f"{len(payload['unknown_files'])} assigned file(s) have no "
+                    "evidence either way; "
+                    f"{len(payload['files_read_per_findings'])} were read "
+                    "regardless (a finding cites them).",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"coverage: {payload['tasks_fully_read']} task(s) read every "
+                    f"assigned file, {payload['tasks_partially_read']} partially, "
+                    f"{payload['tasks_not_reporting']} reported nothing; "
+                    f"{len(payload['unread_files'])} file(s) assigned and never "
+                    f"opened, {len(payload['unknown_files'])} unknown",
+                    file=sys.stderr,
+                )
             json.dump(payload, sys.stdout, indent=2)
             sys.stdout.write("\n")
             return 0

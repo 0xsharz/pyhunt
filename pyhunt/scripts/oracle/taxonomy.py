@@ -125,6 +125,62 @@ def cwe_for(vuln_class: Any) -> str | None:
     return CLASS_CWE.get(normalise(vuln_class))
 
 
+#: Canonical CWE -> CWEs that are strictly more specific readings of it.
+#:
+#: Only pairs where the child is genuinely a descendant in MITRE's hierarchy,
+#: written out by hand rather than inferred. A finding whose CWE refines its
+#: class's canonical CWE is **not** mislabelled: it is better labelled than the
+#: vocabulary can express, and reporting it as a disagreement is noise.
+#:
+#: Measured cost of not having this: 39 of 53 findings on one run were flagged,
+#: 38 of them correct-but-more-precise. At a 74% flag rate the single genuine
+#: conflict (CWE-1188 filed as `insecure_design`/CWE-1173, which are unrelated)
+#: was invisible.
+_CWE_REFINEMENTS: dict[str, frozenset[str]] = {
+    "CWE-400": frozenset({"CWE-770", "CWE-789", "CWE-1050", "CWE-1333"}),
+    "CWE-284": frozenset({"CWE-862", "CWE-863", "CWE-285", "CWE-639"}),
+    "CWE-74": frozenset({"CWE-93", "CWE-113", "CWE-117", "CWE-79", "CWE-89",
+                         "CWE-94", "CWE-77", "CWE-78"}),
+    "CWE-707": frozenset({"CWE-74", "CWE-93", "CWE-113", "CWE-444"}),
+    "CWE-345": frozenset({"CWE-346", "CWE-290", "CWE-347"}),
+    "CWE-664": frozenset({"CWE-400", "CWE-770"}),
+    "CWE-703": frozenset({"CWE-248", "CWE-755"}),
+}
+
+
+def disagreement_kind(vuln_class: Any, declared: Any) -> str | None:
+    """How a finding's CWE disagrees with its class: the *grade* of the problem.
+
+    Three outcomes, and they call for different reactions:
+
+    ``None``
+        No disagreement — the CWE is the class's canonical one.
+    ``"refinement"``
+        The CWE is more specific than the class permits. Either the class is a
+        catch-all (the D18 shape: the finding knows what it is, the label does
+        not) or the CWE is a documented descendant of the canonical one. Worth
+        repairing the label; **not** evidence the finding is wrong.
+    ``"conflict"``
+        The two point at unrelated weaknesses. This is the one to read.
+
+    Splitting these is the whole point. Lumping them produced a 74% flag rate
+    where nothing stood out, which is the same as no signal.
+    """
+    vc = normalise(vuln_class)
+    expected = cwe_for(vc)
+    got = str(declared or "").upper()
+    if not expected or not got or not _CWE_RX.fullmatch(got):
+        return None
+    expected_u = expected.upper()
+    if got == expected_u:
+        return None
+    if got in _CWE_REFINEMENTS.get(expected_u, frozenset()):
+        return "refinement"
+    if vc in _CATCH_ALL:
+        return "refinement"
+    return "conflict"
+
+
 def consistency_errors(finding: dict) -> list[str]:
     """Ways this finding's label disagrees with itself. Advisory, never fatal.
 
@@ -149,13 +205,19 @@ def consistency_errors(finding: dict) -> list[str]:
             "downstream can route it by class — add it to CLASS_CWE or use a "
             "known label")
     elif declared and _CWE_RX.fullmatch(declared) and declared != expected.upper():
-        detail = (f"cwe {declared} does not match vuln_class {vuln_class!r} "
-                  f"(which means {expected})")
-        if vuln_class in _CATCH_ALL:
+        kind = disagreement_kind(vuln_class, declared)
+        detail = (f"[{kind}] cwe {declared} does not match vuln_class "
+                  f"{vuln_class!r} (which means {expected})")
+        if kind == "refinement":
             detail += (
                 ". The CWE is more specific than the class — this is the D18 "
                 "shape: the finding knows what it is and the label does not. "
-                "Prefer the class that matches the CWE")
+                "Prefer the class that matches the CWE. This is a labelling "
+                "refinement, NOT evidence against the finding")
+        else:
+            detail += (
+                ". These name unrelated weaknesses, so one of them is simply "
+                "wrong — read this one")
         problems.append(detail)
     return problems
 

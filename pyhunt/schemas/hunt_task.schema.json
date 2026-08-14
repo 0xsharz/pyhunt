@@ -3,10 +3,20 @@
   "title": "HuntTask",
   "description": "A narrowly-scoped vulnerability hunt assignment: ONE attack class against a specific code region.",
   "type": "object",
-  "required": ["task_id", "attack_class", "scope_hint", "target_files", "rationale", "priority"],
+  "required": [
+    "task_id",
+    "attack_class",
+    "scope_hint",
+    "target_files",
+    "rationale",
+    "priority"
+  ],
   "additionalProperties": false,
   "properties": {
-    "task_id": { "type": "string", "pattern": "^[a-z0-9_-]{1,64}$" },
+    "task_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]{1,64}$"
+    },
     "attack_class": {
       "type": "string",
       "description": "One concrete vulnerability class. Examples: sql_injection, command_injection, path_traversal, ssrf, xxe, deserialization, prototype_pollution, race_condition, integer_overflow, use_after_free, auth_bypass, idor, ssti, open_redirect, xss_stored, xss_reflected, regex_dos, zip_slip, log_injection."
@@ -19,19 +29,40 @@
     "target_files": {
       "type": "array",
       "minItems": 1,
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Repo-relative file paths the hunter should focus on."
     },
-    "rationale": { "type": "string", "minLength": 10 },
-    "priority": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "rationale": {
+      "type": "string",
+      "minLength": 10
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5
+    },
     "source": {
       "type": "string",
-      "enum": ["recon", "gapfill", "feedback", "reconcile", "taint", "sink_backward", "entry_forward", "specialist", "catchall"],
-      "description": "Which stage produced this task. 'reconcile' = F1 completeness re-queue; 'taint' = deterministic entry→sink chunking (V8); 'sink_backward' = orphan-sink backward audit — a dangerous sink no enumerated input reaches, hunted backward through its callers (F3); 'entry_forward' = one task per enumerated entry point followed forward, queued whether or not a sink was found behind it (W4.3) — sink-backward finds what is reachable FROM a known sink, entry-forward finds sinks the table does not know; 'specialist' = gated repo-wide specialist sweep (V12) — see 'specialist'; 'catchall' = terminal whole-repo coverage sweep (F6) — LOW-priority hunt for an eligible source file no other task covered."
+      "enum": [
+        "recon",
+        "gapfill",
+        "feedback",
+        "reconcile",
+        "taint",
+        "sink_backward",
+        "entry_forward",
+        "specialist",
+        "catchall",
+        "dismissal",
+        "probe_gap"
+      ],
+      "description": "Which generator emitted this task. 'dismissal' comes from lens_matrix.py (a surface cleared under one lens, re-queued under the others); 'probe_gap' from coverage.py probe-gap. Both were absent from this enum for a release, so _validate_tasks dropped every task the two recall mechanisms produced \u2014 silently, because dropping is not an error. Keep this list in step with scripts/{taint,specialists,catchall,lens_matrix,coverage}.py."
     },
     "specialist": {
       "type": "string",
-      "description": "Set when source='specialist': the SPECIALIST_HINTS key (audit.lang.hints) naming which repo-wide lens to hunt with — crypto|logic-bug|access-control|deserialization|batch-etl|iac|codegen. Flows into Hunt's hints_for(specialist=...) call so the researcher gets the specialist lens instead of the generic language hints."
+      "description": "Set when source='specialist': the SPECIALIST_HINTS key (audit.lang.hints) naming which repo-wide lens to hunt with \u2014 crypto|logic-bug|access-control|deserialization|batch-etl|iac|codegen. Flows into Hunt's hints_for(specialist=...) call so the researcher gets the specialist lens instead of the generic language hints."
     }
   }
 }

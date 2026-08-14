@@ -249,7 +249,7 @@
               },
               "input_builder": {
                 "type": "object",
-                "description": "kind=growth_curve: a size-parameterised input from the closed builder vocabulary (repeat_str, list_of, nested_list, nested_dict, repeat_key, json_text).",
+                "description": "kind=growth_curve: a size-parameterised input from the closed builder vocabulary (repeat_str, list_of, nested_list, nested_dict, repeat_key, json_text, repeat_bytes, framed_bytes). The two byte shapes exist for protocol parsers, whose entry points take bytes: without them the benign rung of the differential fails alongside the hostile one and the probe can only return probe_error.",
                 "required": [
                   "kind"
                 ]
@@ -427,8 +427,49 @@
                 }
               }
             }
+          },
+          "recorded_at": {
+            "type": "string",
+            "description": "When findings_io normalised this record. Written by the pipeline, not the hunter."
+          },
+          "vuln_class_original": {
+            "type": "string",
+            "description": "The hunter's original vuln_class, kept when class-check repaired it."
+          },
+          "class_repaired_by": {
+            "type": "string",
+            "description": "Which step rewrote vuln_class, so a relabelling is attributable."
+          },
+          "group_id": {
+            "type": "string",
+            "description": "dedupe.py site group this record belongs to."
+          },
+          "is_canonical": {
+            "type": "boolean",
+            "description": "True for the one record dedupe.py elected to represent its site."
+          },
+          "independent_units": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many hunt units reached this site without seeing each other's work. Corroboration, not redundancy."
+          },
+          "duplicate_finding_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Other findings collapsed onto this canonical."
+          },
+          "duplicate_of": {
+            "type": "string",
+            "description": "Set on a non-canonical record, naming its canonical."
+          },
+          "fingerprint": {
+            "type": "string",
+            "description": "Content-addressed identity from fingerprint.py, stable across runs."
           }
-        }
+        },
+        "description": "Fields the PIPELINE writes (execution, structural, recorded_at, group_id, is_canonical, independent_units, duplicate_finding_ids, duplicate_of, fingerprint, vuln_class_original, class_repaired_by) are listed here so that additionalProperties:false does not reject the tool's own output. They were absent for a release, which made `findings_io validate` report 53/53 invalid on a real run \u2014 a validator that fails everything carries no signal at all."
       }
     },
     "gaps_observed": {

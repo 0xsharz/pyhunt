@@ -132,6 +132,63 @@ def _substitute(value, nonce, benign):
     return value
 
 
+def encodings_of(text):
+    """Every byte form of `text` that a pass-through encode could produce.
+
+    A `str` -> `bytes` encode changes the object's type and not one byte of its
+    content, so it must count as UNALTERED by a flow witness. Comparing by type
+    alone did not, and the consequence was the worst kind of wrong verdict this
+    oracle can produce: a real CR/LF header-injection finding came back
+    `refuted` because `utilities._to_bytes` encoded the sentinel-bearing header
+    value on its way to the sink. `refuted` is the verdict that argues a defence
+    *works*, so a false one buries a live finding under machine authority. Two
+    phase 2c verifiers had to reconstruct the encode by hand from the replay
+    transcript to overturn it.
+
+    Module-level (rather than nested in the witness) so the property can be
+    tested directly instead of by grepping the source.
+    """
+    out = set()
+    for codec in ("utf-8", "latin-1", "ascii"):
+        try:
+            out.add(text.encode(codec))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _as_bytes(builder, field, default=b""):
+    """One byte-valued field of a builder spec, from hex or from latin-1 text.
+
+    Two spellings, both pure data — the closed-vocabulary property is the
+    security control here and must not be relaxed into "eval a snippet":
+
+    ``<field>_hex``   ``"000006040000000000"`` — exact bytes, whitespace ignored
+    ``<field>_text``  ``"GET / {{NONCE}}"`` — encoded latin-1, so every byte
+                      0-255 is expressible and placeholder substitution (which
+                      runs over strings, before this) still reaches inside.
+
+    A malformed hex string raises rather than falling back, because a probe that
+    quietly measured a *different* payload than the spec asked for would produce
+    a confident number about the wrong thing.
+    """
+    spec = builder or {}
+    text = spec.get(field + "_text")
+    if isinstance(text, str):
+        return text.encode("latin-1", errors="strict")
+    raw = spec.get(field + "_hex")
+    if isinstance(raw, str):
+        cleaned = "".join(raw.split())
+        try:
+            return bytes.fromhex(cleaned)
+        except ValueError as exc:
+            raise ValueError(
+                "builder field %r is not valid hex (%s); give %s_hex as hex "
+                "digits or use %s_text for latin-1 text"
+                % (field + "_hex", exc, field, field)) from exc
+    return default
+
+
 def _build_sized(builder, size):
     """Expand a size-parameterised input from a closed builder vocabulary.
 
@@ -145,12 +202,34 @@ def _build_sized(builder, size):
     ``repeat_key``    a dict of ``size`` distinct keys, each mapped to ``leaf``
     ``json_text``     the JSON text of any of the above, as a string
     ``list_of``       a list containing ``size`` copies of ``leaf``
+    ``repeat_bytes``  ``size`` copies of a byte unit, as ``bytes``
+    ``framed_bytes``  a preamble followed by ``size`` copies of a fixed frame
+
+    The two byte shapes exist because the vocabulary above emits only ``str``,
+    ``list`` and ``dict`` — and a protocol parser takes ``bytes``. On a sans-IO
+    HTTP/2 target every entry point wanted bytes, so the *benign* rung of each
+    differential died alongside the hostile one and the probe could only return
+    ``probe_error``. The hunters correctly declined to declare any growth probe
+    at all, which meant the one oracle able to settle that target's main finding
+    class was never armed: the coverage gap did not close, it moved somewhere
+    less visible.
+
+    Byte units are given as hex (``unit_hex``) or as text encoded latin-1
+    (``unit_text``). Text is what lets ``{{NONCE}}`` and ``{{BENIGN}}``
+    substitution reach inside a byte payload, since both placeholders are ASCII.
 
     Anything else raises, and the probe reports ``error`` — an unknown builder
     is a spec bug, and guessing at one would silently measure the wrong thing.
     """
     kind = (builder or {}).get("kind")
     leaf = (builder or {}).get("leaf", 0)
+    if kind == "repeat_bytes":
+        return (_as_bytes(builder, "prefix")
+                + _as_bytes(builder, "unit", default=b"A") * size
+                + _as_bytes(builder, "suffix"))
+    if kind == "framed_bytes":
+        return (_as_bytes(builder, "preamble")
+                + _as_bytes(builder, "frame", default=b"\x00") * size)
     if kind == "repeat_str":
         unit = builder.get("unit", "A")
         return builder.get("prefix", "") + unit * size + builder.get("suffix", "")
@@ -891,6 +970,15 @@ def _probe_flow_witness(spec):
             return
         if isinstance(value, str) and nonce in value:
             original_values.add(value)
+            original_values.update(encodings_of(value))
+        elif isinstance(value, (bytes, bytearray)) and nonce.encode() in bytes(value):
+            raw = bytes(value)
+            original_values.add(raw)
+            for codec in ("utf-8", "latin-1"):
+                try:
+                    original_values.add(raw.decode(codec))
+                except Exception:  # noqa: BLE001
+                    continue
         elif isinstance(value, dict):
             for key, item in list(value.items())[:_FLOW_MAX_ITEMS]:
                 _collect_originals(key, depth + 1)
@@ -914,8 +1002,15 @@ def _probe_flow_witness(spec):
                 if not _contains_nonce(value, nonce):
                     continue
                 carries = True
-                if isinstance(value, str) and value in original_values:
-                    return True, True
+                # `original_values` now holds each original alongside its
+                # encode/decode twins, so a pure `str`<->`bytes` conversion
+                # still matches and is reported as UNALTERED. A sanitiser that
+                # actually rewrites the payload changes the content and will
+                # not match either form.
+                if isinstance(value, (str, bytes, bytearray)):
+                    probe = bytes(value) if isinstance(value, bytearray) else value
+                    if probe in original_values:
+                        return True, True
             except Exception:  # noqa: BLE001
                 continue
         return carries, False

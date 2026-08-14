@@ -753,6 +753,29 @@ static argument alone, and the report now says so by name.
 
 ## 7. Output
 
+> **Write the file after every task, not once at the end.** When you finish a
+> task, immediately write `<unit_id>.json` containing every task you have
+> completed so far, then start the next one. Overwrite it each time with the
+> growing array.
+>
+> This is not tidiness. Four of six hunt units in one wave died at *exactly* the
+> moment they assembled their single output file — three on a transport error,
+> one on a stall — after roughly 200k tokens of analysis each. Their PoCs had
+> already been written to their scratch dirs, so the expensive work demonstrably
+> happened; the findings, flows, severities and arguments existed only in a
+> context that was then gone. The remedy in `phase2_hunt.md` §6 is to re-dispatch
+> the unit unchanged, which pays the whole cost again.
+>
+> The contract used to schedule the largest and most fragile write at the point
+> where the most state was at risk. Writing incrementally makes a crash cost one
+> task instead of five. The orchestrator's collect step already reads a
+> per-task object, so nothing downstream changes.
+>
+> **Work only inside your own `scratch_dir`.** A unit in that same wave stalled
+> for 600s after colliding with a sibling unit's scratchpad. Your assignment
+> names the directory; do not write to the session scratchpad, and never to a
+> path containing another unit's id.
+
 Write **one JSON object** to `<results_dir>/logs/hunt/<unit_id>.json` and
 nothing else there. It must validate against `schemas/finding.schema.json`:
 

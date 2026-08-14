@@ -226,6 +226,36 @@ be you writing the assertion again:
 | `nested_dict` | `size` levels of `{key: ...}` around `leaf` |
 | `repeat_key` | a dict of `size` distinct keys |
 | `json_text` | the JSON text of any of the above |
+| `repeat_bytes` | `prefix + unit * size + suffix`, as **bytes** |
+| `framed_bytes` | `preamble + frame * size`, as **bytes** |
+
+### If your target takes bytes, use the byte builders — do not skip the probe
+
+`repeat_bytes` and `framed_bytes` take their values as `<field>_hex` (hex
+digits, whitespace ignored) or `<field>_text` (encoded latin-1, so `{{NONCE}}`
+and `{{BENIGN}}` substitution still reaches inside the payload).
+
+```json
+"input_builder": {"kind": "framed_bytes",
+                  "preamble_hex": "505249202a20485454502f322e300d0a0d0a534d0d0a0d0a",
+                  "frame_hex":    "000000040000000000"}
+```
+
+`framed_bytes` is the shape a protocol parser needs: a fixed preamble, then
+`size` copies of one frame. "How much does the victim spend per frame the
+attacker sends" is exactly a growth curve.
+
+This matters more than a missing convenience. On a sans-IO HTTP/2 target the
+execution gate can promote nothing — the library raises no audit event on any
+path — so the structural oracle was the **only** oracle with anything to say.
+Every entry point took bytes, the vocabulary emitted only `str`/`list`/`dict`,
+the benign rung died with the hostile one, and the hunters reasonably declared
+no probe at all. Three of 53 findings carried one. The gap did not close; it
+moved somewhere a reader could not see it.
+
+So: if the only thing stopping you declaring a probe is the input type, that is
+no longer a reason. If something *else* stops you, say so in `gaps_observed`
+rather than leaving the finding silently unprobed.
 
 Two practical notes. Pick `sizes` that the *benign* rung clears in well under a
 second — the ceiling is the ladder's, not each rung's. And for a recursion
